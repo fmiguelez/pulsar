@@ -18,6 +18,26 @@
  */
 package org.apache.pulsar.functions.worker;
 
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyBoolean;
+import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.argThat;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+import static org.powermock.api.mockito.PowerMockito.mockStatic;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
+
 import io.netty.buffer.Unpooled;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.distributedlog.api.namespace.Namespace;
@@ -27,19 +47,28 @@ import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.Reader;
 import org.apache.pulsar.client.api.ReaderBuilder;
+import org.apache.pulsar.client.impl.MessageIdImpl;
 import org.apache.pulsar.client.impl.MessageImpl;
-import org.apache.pulsar.common.api.proto.PulsarApi;
+import org.apache.pulsar.common.functions.AuthenticationConfig;
+import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.util.ObjectMapperFactory;
 import org.apache.pulsar.functions.proto.Function;
+import org.apache.pulsar.functions.runtime.RuntimeFactory;
 import org.apache.pulsar.functions.runtime.kubernetes.KubernetesRuntime;
 import org.apache.pulsar.functions.runtime.kubernetes.KubernetesRuntimeFactory;
-import org.apache.pulsar.functions.runtime.process.ProcessRuntimeFactory;
-import org.apache.pulsar.functions.runtime.thread.ThreadRuntimeFactoryConfig;
-import org.apache.pulsar.functions.runtime.thread.ThreadRuntimeFactory;
 import org.apache.pulsar.functions.runtime.kubernetes.KubernetesRuntimeFactoryConfig;
+import org.apache.pulsar.functions.runtime.process.ProcessRuntimeFactory;
+import org.apache.pulsar.functions.runtime.thread.ThreadRuntimeFactory;
+import org.apache.pulsar.functions.runtime.thread.ThreadRuntimeFactoryConfig;
+import org.apache.pulsar.functions.secretsproviderconfigurator.SecretsProviderConfigurator;
 import org.apache.pulsar.functions.utils.FunctionCommon;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
+import org.powermock.api.mockito.PowerMockito;
+import org.powermock.core.classloader.annotations.PowerMockIgnore;
+import org.powermock.core.classloader.annotations.PrepareForTest;
+import org.testng.IObjectFactory;
+import org.testng.annotations.ObjectFactory;
 import org.testng.annotations.Test;
 
 import java.util.HashMap;
@@ -47,31 +76,22 @@ import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.TimeUnit;
 
-import static org.mockito.Mockito.doNothing;
-import static org.mockito.Mockito.any;
-import static org.mockito.Mockito.anyBoolean;
-import static org.mockito.Mockito.anyString;
-import static org.mockito.Mockito.argThat;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.reset;
-import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.times;
-import static org.mockito.Mockito.verify;
-import static org.mockito.Mockito.when;
-import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertNotNull;
-import static org.testng.Assert.assertNull;
-import static org.testng.Assert.assertTrue;
-import static org.testng.Assert.fail;
-
+@PrepareForTest({FunctionRuntimeManager.class, RuntimeFactory.class})
 @Slf4j
+@PowerMockIgnore({
+    "javax.management.*",
+    "javax.ws.*",
+    "org.apache.logging.log4j.*",
+    "org.apache.pulsar.functions.runtime.thread"
+})
 public class FunctionRuntimeManagerTest {
+
+    @ObjectFactory
+    public IObjectFactory getObjectFactory() {
+        return new org.powermock.modules.testng.PowerMockObjectFactory();
+    }
 
     @Test
     public void testProcessAssignmentUpdateAddFunctions() throws Exception {
@@ -94,9 +114,14 @@ public class FunctionRuntimeManagerTest {
         doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
         doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
         doReturn(mock(Reader.class)).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
+        PulsarWorkerService workerService = mock(PulsarWorkerService.class);
         doReturn(pulsarClient).when(workerService).getClient();
         doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
+
+        mockStatic(RuntimeFactory.class);
+        PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(eq(ThreadRuntimeFactory.class.getName())))
+            .thenReturn(new ThreadRuntimeFactory());
+
         // test new assignment add functions
         FunctionRuntimeManager functionRuntimeManager = spy(new FunctionRuntimeManager(
                 workerConfig,
@@ -106,6 +131,7 @@ public class FunctionRuntimeManagerTest {
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class)));
         FunctionActioner functionActioner = spy(functionRuntimeManager.getFunctionActioner());
         doNothing().when(functionActioner).startFunction(any(FunctionRuntimeInfo.class));
@@ -177,9 +203,13 @@ public class FunctionRuntimeManagerTest {
         doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
         doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
         doReturn(mock(Reader.class)).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
+        PulsarWorkerService workerService = mock(PulsarWorkerService.class);
         doReturn(pulsarClient).when(workerService).getClient();
         doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
+
+        mockStatic(RuntimeFactory.class);
+        PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(eq(ThreadRuntimeFactory.class.getName())))
+            .thenReturn(new ThreadRuntimeFactory());
 
         // test new assignment delete functions
         FunctionRuntimeManager functionRuntimeManager = spy(new FunctionRuntimeManager(
@@ -190,6 +220,7 @@ public class FunctionRuntimeManagerTest {
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class)));
         FunctionActioner functionActioner = spy(functionRuntimeManager.getFunctionActioner());
         doNothing().when(functionActioner).startFunction(any(FunctionRuntimeInfo.class));
@@ -264,9 +295,13 @@ public class FunctionRuntimeManagerTest {
         doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
         doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
         doReturn(mock(Reader.class)).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
+        PulsarWorkerService workerService = mock(PulsarWorkerService.class);
         doReturn(pulsarClient).when(workerService).getClient();
         doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
+
+        mockStatic(RuntimeFactory.class);
+        PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(eq(ThreadRuntimeFactory.class.getName())))
+            .thenReturn(new ThreadRuntimeFactory());
 
         // test new assignment update functions
         FunctionRuntimeManager functionRuntimeManager = new FunctionRuntimeManager(
@@ -277,6 +312,7 @@ public class FunctionRuntimeManagerTest {
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class));
         FunctionActioner functionActioner = spy(functionRuntimeManager.getFunctionActioner());
         doNothing().when(functionActioner).startFunction(any(FunctionRuntimeInfo.class));
@@ -395,9 +431,13 @@ public class FunctionRuntimeManagerTest {
         doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
         doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
         doReturn(mock(Reader.class)).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
+        PulsarWorkerService workerService = mock(PulsarWorkerService.class);
         doReturn(pulsarClient).when(workerService).getClient();
         doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
+
+        mockStatic(RuntimeFactory.class);
+        PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(eq(ThreadRuntimeFactory.class.getName())))
+            .thenReturn(new ThreadRuntimeFactory());
 
         // test new assignment update functions
         FunctionRuntimeManager functionRuntimeManager = new FunctionRuntimeManager(
@@ -408,6 +448,7 @@ public class FunctionRuntimeManagerTest {
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class));
         FunctionActioner functionActioner = spy(functionRuntimeManager.getFunctionActioner());
         doNothing().when(functionActioner).startFunction(any(FunctionRuntimeInfo.class));
@@ -483,131 +524,6 @@ public class FunctionRuntimeManagerTest {
         assertEquals(functionRuntimeManager.functionRuntimeInfos.get("test-tenant/test-namespace/func-1:0"), functionRuntimeInfo);
     }
 
-    @Test(timeOut = 10000)
-    public void testErrorNotifier() throws Exception {
-        WorkerConfig workerConfig = new WorkerConfig();
-        workerConfig.setWorkerId("worker-1");
-        workerConfig.setFunctionRuntimeFactoryClassName(ThreadRuntimeFactory.class.getName());
-        workerConfig.setFunctionRuntimeFactoryConfigs(
-                ObjectMapperFactory.getThreadLocal().convertValue(
-                        new ThreadRuntimeFactoryConfig().setThreadGroupName("test"), Map.class));
-        workerConfig.setPulsarServiceUrl("pulsar://localhost:6650");
-        workerConfig.setStateStorageServiceUrl("foo");
-        workerConfig.setFunctionAssignmentTopicName("assignments");
-
-        Function.FunctionMetaData function1 = Function.FunctionMetaData.newBuilder().setFunctionDetails(
-                Function.FunctionDetails.newBuilder()
-                        .setTenant("test-tenant").setNamespace("test-namespace").setName("func-1")).build();
-
-        Function.FunctionMetaData function2 = Function.FunctionMetaData.newBuilder().setFunctionDetails(
-                Function.FunctionDetails.newBuilder()
-                        .setTenant("test-tenant").setNamespace("test-namespace").setName("func-2")).build();
-
-        Function.Assignment assignment1 = Function.Assignment.newBuilder()
-                .setWorkerId("worker-1")
-                .setInstance(Function.Instance.newBuilder()
-                        .setFunctionMetaData(function1).setInstanceId(0).build())
-                .build();
-        Function.Assignment assignment2 = Function.Assignment.newBuilder()
-                .setWorkerId("worker-1")
-                .setInstance(Function.Instance.newBuilder()
-                        .setFunctionMetaData(function2).setInstanceId(0).build())
-                .build();
-
-        ArrayBlockingQueue<Message<byte[]>> messageList = new ArrayBlockingQueue<>(2);
-        PulsarApi.MessageMetadata.Builder msgMetadataBuilder = PulsarApi.MessageMetadata.newBuilder();
-        Message message1 = spy(new MessageImpl("foo", MessageId.latest.toString(),
-                new HashMap<>(), Unpooled.copiedBuffer(assignment1.toByteArray()), null, msgMetadataBuilder));
-        doReturn(FunctionCommon.getFullyQualifiedInstanceId(assignment1.getInstance())).when(message1).getKey();
-
-        Message message2 = spy(new MessageImpl("foo", MessageId.latest.toString(),
-                new HashMap<>(), Unpooled.copiedBuffer(assignment2.toByteArray()), null, msgMetadataBuilder));
-        doReturn(FunctionCommon.getFullyQualifiedInstanceId(assignment2.getInstance())).when(message2).getKey();
-
-        PulsarClient pulsarClient = mock(PulsarClient.class);
-
-        Reader<byte[]> reader = mock(Reader.class);
-
-
-        when(reader.readNext()).thenAnswer(new Answer<Message<byte[]>>() {
-            @Override
-            public Message<byte[]> answer(InvocationOnMock invocationOnMock) throws Throwable {
-                return messageList.poll(10, TimeUnit.SECONDS);
-            }
-        });
-
-        when(reader.readNextAsync()).thenAnswer(new Answer<CompletableFuture<Message<byte[]>>>() {
-            @Override
-            public CompletableFuture<Message<byte[]>> answer(InvocationOnMock invocationOnMock) throws Throwable {
-                return new CompletableFuture<>();
-            }
-        });
-
-        when(reader.hasMessageAvailable()).thenAnswer(new Answer<Boolean>() {
-            @Override
-            public Boolean answer(InvocationOnMock invocationOnMock) throws Throwable {
-                return !messageList.isEmpty();
-            }
-        });
-
-        ReaderBuilder readerBuilder = mock(ReaderBuilder.class);
-        doReturn(readerBuilder).when(pulsarClient).newReader();
-        doReturn(readerBuilder).when(readerBuilder).topic(anyString());
-        doReturn(readerBuilder).when(readerBuilder).readerName(anyString());
-        doReturn(readerBuilder).when(readerBuilder).subscriptionRolePrefix(anyString());
-        doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
-        doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
-        doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
-
-        doReturn(reader).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
-        doReturn(pulsarClient).when(workerService).getClient();
-        doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
-
-        ErrorNotifier errorNotifier = spy(ErrorNotifier.getDefaultImpl());
-
-        // test new assignment add functions
-        FunctionRuntimeManager functionRuntimeManager = spy(new FunctionRuntimeManager(
-                workerConfig,
-                workerService,
-                mock(Namespace.class),
-                mock(MembershipManager.class),
-                mock(ConnectorsManager.class),
-                mock(FunctionsManager.class),
-                mock(FunctionMetaDataManager.class),
-                errorNotifier));
-        FunctionActioner functionActioner = spy(functionRuntimeManager.getFunctionActioner());
-        doNothing().when(functionActioner).startFunction(any(FunctionRuntimeInfo.class));
-        doNothing().when(functionActioner).stopFunction(any(FunctionRuntimeInfo.class));
-        doNothing().when(functionActioner).terminateFunction(any(FunctionRuntimeInfo.class));
-        functionRuntimeManager.setFunctionActioner(functionActioner);
-
-        functionRuntimeManager.initialize();
-
-        // verify no errors occured
-        verify(errorNotifier, times(0)).triggerError(any());
-
-        messageList.add(message1);
-
-        functionRuntimeManager.start();
-
-        verify(errorNotifier, times(0)).triggerError(any());
-
-        // trigger an error to be thrown
-        doThrow(new RuntimeException("test")).when(functionRuntimeManager).processAssignment(any());
-
-        messageList.add(message2);
-
-        try {
-            errorNotifier.waitForError();
-        } catch (Exception e) {
-            assertEquals(e.getCause().getMessage(), "test");
-        }
-        verify(errorNotifier, times(1)).triggerError(any());
-
-        functionRuntimeManager.close();
-    }
-
     @Test
     public void testRuntimeManagerInitialize() throws Exception {
         WorkerConfig workerConfig = new WorkerConfig();
@@ -646,18 +562,22 @@ public class FunctionRuntimeManagerTest {
                 .build();
 
         List<Message<byte[]>> messageList = new LinkedList<>();
-        PulsarApi.MessageMetadata.Builder msgMetadataBuilder = PulsarApi.MessageMetadata.newBuilder();
-        Message message1 = spy(new MessageImpl("foo", MessageId.latest.toString(),
-                new HashMap<>(), Unpooled.copiedBuffer(assignment1.toByteArray()), null, msgMetadataBuilder));
+        MessageMetadata metadata = new MessageMetadata();
+
+        MessageId messageId1 = new MessageIdImpl(0, 1, -1);
+        Message message1 = spy(new MessageImpl("foo", messageId1.toString(),
+                new HashMap<>(), Unpooled.copiedBuffer(assignment1.toByteArray()), null, metadata));
         doReturn(FunctionCommon.getFullyQualifiedInstanceId(assignment1.getInstance())).when(message1).getKey();
 
-        Message message2 = spy(new MessageImpl("foo", MessageId.latest.toString(),
-                new HashMap<>(), Unpooled.copiedBuffer(assignment2.toByteArray()), null, msgMetadataBuilder));
+        MessageId messageId2 = new MessageIdImpl(0, 2, -1);
+        Message message2 = spy(new MessageImpl("foo", messageId2.toString(),
+                new HashMap<>(), Unpooled.copiedBuffer(assignment2.toByteArray()), null, metadata));
         doReturn(FunctionCommon.getFullyQualifiedInstanceId(assignment2.getInstance())).when(message2).getKey();
 
         // delete function2
-        Message message3 = spy(new MessageImpl("foo", MessageId.latest.toString(),
-                new HashMap<>(), Unpooled.copiedBuffer("".getBytes()), null, msgMetadataBuilder));
+        MessageId messageId3 = new MessageIdImpl(0, 3, -1);
+        Message message3 = spy(new MessageImpl("foo", messageId3.toString(),
+                new HashMap<>(), Unpooled.copiedBuffer("".getBytes()), null, metadata));
         doReturn(FunctionCommon.getFullyQualifiedInstanceId(assignment3.getInstance())).when(message3).getKey();
 
         messageList.add(message1);
@@ -701,11 +621,15 @@ public class FunctionRuntimeManagerTest {
         doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
 
         doReturn(reader).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
+        PulsarWorkerService workerService = mock(PulsarWorkerService.class);
         doReturn(pulsarClient).when(workerService).getClient();
         doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
 
         ErrorNotifier errorNotifier = mock(ErrorNotifier.class);
+
+        mockStatic(RuntimeFactory.class);
+        PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(eq(ThreadRuntimeFactory.class.getName())))
+            .thenReturn(new ThreadRuntimeFactory());
 
         // test new assignment add functions
         FunctionRuntimeManager functionRuntimeManager = new FunctionRuntimeManager(
@@ -716,6 +640,7 @@ public class FunctionRuntimeManagerTest {
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 errorNotifier);
         FunctionActioner functionActioner = spy(functionRuntimeManager.getFunctionActioner());
         doNothing().when(functionActioner).startFunction(any(FunctionRuntimeInfo.class));
@@ -723,7 +648,7 @@ public class FunctionRuntimeManagerTest {
         doNothing().when(functionActioner).terminateFunction(any(FunctionRuntimeInfo.class));
         functionRuntimeManager.setFunctionActioner(functionActioner);
 
-        functionRuntimeManager.initialize();
+        assertEquals(functionRuntimeManager.initialize(), messageId3);
 
         assertEquals(functionRuntimeManager.workerIdToAssignments.size(), 1);
         verify(functionActioner, times(1)).startFunction(any(FunctionRuntimeInfo.class));
@@ -740,7 +665,7 @@ public class FunctionRuntimeManagerTest {
                         Function.Instance.newBuilder().setFunctionMetaData(function1).setInstanceId(0)
                                 .build()));
 
-        // verify no errors occured
+        // verify no errors occurred
         verify(errorNotifier, times(0)).triggerError(any());
     }
 
@@ -764,11 +689,19 @@ public class FunctionRuntimeManagerTest {
         doReturn(readerBuilder).when(readerBuilder).startMessageId(any());
         doReturn(readerBuilder).when(readerBuilder).readCompacted(anyBoolean());
         doReturn(mock(Reader.class)).when(readerBuilder).create();
-        WorkerService workerService = mock(WorkerService.class);
+        PulsarWorkerService workerService = mock(PulsarWorkerService.class);
         doReturn(pulsarClient).when(workerService).getClient();
         doReturn(mock(PulsarAdmin.class)).when(workerService).getFunctionAdmin();
 
         KubernetesRuntimeFactory kubernetesRuntimeFactory = mock(KubernetesRuntimeFactory.class);
+        doNothing().when(kubernetesRuntimeFactory).initialize(
+            any(WorkerConfig.class),
+            any(AuthenticationConfig.class),
+            any(SecretsProviderConfigurator.class),
+            any(),
+            any(),
+            any()
+        );
         doNothing().when(kubernetesRuntimeFactory).setupClient();
         doReturn(true).when(kubernetesRuntimeFactory).externallyManaged();
 
@@ -779,6 +712,10 @@ public class FunctionRuntimeManagerTest {
                 workerConfig,
                 kubernetesRuntimeFactory, null, null, null, null));
 
+        mockStatic(RuntimeFactory.class);
+        PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(anyString()))
+            .thenReturn(kubernetesRuntimeFactory);
+
         // test new assignment update functions
         FunctionRuntimeManager functionRuntimeManager = new FunctionRuntimeManager(
                 workerConfig,
@@ -788,6 +725,7 @@ public class FunctionRuntimeManagerTest {
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class));
         functionRuntimeManager.setFunctionActioner(functionActioner);
 
@@ -887,12 +825,13 @@ public class FunctionRuntimeManagerTest {
             workerConfig.setFunctionAssignmentTopicName("assignments");
             new FunctionRuntimeManager(
                     workerConfig,
-                    mock(WorkerService.class),
+                    mock(PulsarWorkerService.class),
                     mock(Namespace.class),
                     mock(MembershipManager.class),
                     mock(ConnectorsManager.class),
                     mock(FunctionsManager.class),
                     mock(FunctionMetaDataManager.class),
+                    mock(WorkerStatsManager.class),
                     mock(ErrorNotifier.class));
 
             fail();
@@ -912,12 +851,13 @@ public class FunctionRuntimeManagerTest {
             workerConfig.setFunctionAssignmentTopicName("assignments");
             new FunctionRuntimeManager(
                     workerConfig,
-                    mock(WorkerService.class),
+                    mock(PulsarWorkerService.class),
                     mock(Namespace.class),
                     mock(MembershipManager.class),
                     mock(ConnectorsManager.class),
                     mock(FunctionsManager.class),
                     mock(FunctionMetaDataManager.class),
+                    mock(WorkerStatsManager.class),
                     mock(ErrorNotifier.class));
 
             fail();
@@ -937,12 +877,13 @@ public class FunctionRuntimeManagerTest {
             workerConfig.setFunctionAssignmentTopicName("assignments");
             new FunctionRuntimeManager(
                     workerConfig,
-                    mock(WorkerService.class),
+                    mock(PulsarWorkerService.class),
                     mock(Namespace.class),
                     mock(MembershipManager.class),
                     mock(ConnectorsManager.class),
                     mock(FunctionsManager.class),
                     mock(FunctionMetaDataManager.class),
+                    mock(WorkerStatsManager.class),
                     mock(ErrorNotifier.class));
 
             fail();
@@ -960,18 +901,25 @@ public class FunctionRuntimeManagerTest {
             workerConfig.setPulsarServiceUrl("pulsar://localhost:6650");
             workerConfig.setStateStorageServiceUrl("foo");
             workerConfig.setFunctionAssignmentTopicName("assignments");
+
+            mockStatic(RuntimeFactory.class);
+            PowerMockito.when(RuntimeFactory.getFuntionRuntimeFactory(eq(ThreadRuntimeFactory.class.getName())))
+                .thenReturn(new ThreadRuntimeFactory());
+
             FunctionRuntimeManager functionRuntimeManager = new FunctionRuntimeManager(
                     workerConfig,
-                    mock(WorkerService.class),
+                    mock(PulsarWorkerService.class),
                     mock(Namespace.class),
                     mock(MembershipManager.class),
                     mock(ConnectorsManager.class),
                     mock(FunctionsManager.class),
                     mock(FunctionMetaDataManager.class),
+                    mock(WorkerStatsManager.class),
                     mock(ErrorNotifier.class));
 
             assertEquals(functionRuntimeManager.getRuntimeFactory().getClass(), ThreadRuntimeFactory.class);
         } catch (Exception e) {
+            log.error("Failed to initialize the runtime manager : ", e);
             fail();
         }
     }
@@ -984,23 +932,38 @@ public class FunctionRuntimeManagerTest {
                 = new WorkerConfig.KubernetesContainerFactory();
         kubernetesContainerFactory.setK8Uri("k8Uri");
         kubernetesContainerFactory.setJobNamespace("jobNamespace");
+        kubernetesContainerFactory.setJobName("jobName");
         kubernetesContainerFactory.setPulsarDockerImageName("pulsarDockerImageName");
         kubernetesContainerFactory.setImagePullPolicy("imagePullPolicy");
         kubernetesContainerFactory.setPulsarRootDir("pulsarRootDir");
         WorkerConfig workerConfig = new WorkerConfig();
         workerConfig.setKubernetesContainerFactory(kubernetesContainerFactory);
 
+        KubernetesRuntimeFactory mockedKubernetesRuntimeFactory = spy(new KubernetesRuntimeFactory());
+        doNothing().when(mockedKubernetesRuntimeFactory).initialize(
+            any(WorkerConfig.class),
+            any(AuthenticationConfig.class),
+            any(SecretsProviderConfigurator.class),
+            any(),
+            any(),
+            any()
+        );
+        doNothing().when(mockedKubernetesRuntimeFactory).setupClient();
+        doReturn(true).when(mockedKubernetesRuntimeFactory).externallyManaged();
+        PowerMockito.whenNew(KubernetesRuntimeFactory.class)
+            .withNoArguments().thenReturn(mockedKubernetesRuntimeFactory);
+
         FunctionRuntimeManager functionRuntimeManager = new FunctionRuntimeManager(
                 workerConfig,
-                mock(WorkerService.class),
+                mock(PulsarWorkerService.class),
                 mock(Namespace.class),
                 mock(MembershipManager.class),
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class));
 
-        assertEquals(functionRuntimeManager.getRuntimeFactory().getClass(), KubernetesRuntimeFactory.class);
         KubernetesRuntimeFactory kubernetesRuntimeFactory = (KubernetesRuntimeFactory) functionRuntimeManager.getRuntimeFactory();
         assertEquals(kubernetesRuntimeFactory.getK8Uri(), "k8Uri");
         assertEquals(kubernetesRuntimeFactory.getJobNamespace(), "jobNamespace");
@@ -1021,12 +984,13 @@ public class FunctionRuntimeManagerTest {
 
         functionRuntimeManager = new FunctionRuntimeManager(
                 workerConfig,
-                mock(WorkerService.class),
+                mock(PulsarWorkerService.class),
                 mock(Namespace.class),
                 mock(MembershipManager.class),
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class));
 
         assertEquals(functionRuntimeManager.getRuntimeFactory().getClass(), ProcessRuntimeFactory.class);
@@ -1046,12 +1010,13 @@ public class FunctionRuntimeManagerTest {
 
         functionRuntimeManager = new FunctionRuntimeManager(
                 workerConfig,
-                mock(WorkerService.class),
+                mock(PulsarWorkerService.class),
                 mock(Namespace.class),
                 mock(MembershipManager.class),
                 mock(ConnectorsManager.class),
                 mock(FunctionsManager.class),
                 mock(FunctionMetaDataManager.class),
+                mock(WorkerStatsManager.class),
                 mock(ErrorNotifier.class));
 
         assertEquals(functionRuntimeManager.getRuntimeFactory().getClass(), ThreadRuntimeFactory.class);

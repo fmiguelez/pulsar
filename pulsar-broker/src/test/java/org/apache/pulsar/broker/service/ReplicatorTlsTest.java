@@ -34,7 +34,7 @@ public class ReplicatorTlsTest extends ReplicatorTestBase {
 
     @Override
     @BeforeClass(timeOut = 300000)
-    void setup() throws Exception {
+    public void setup() throws Exception {
         config1.setBrokerClientTlsEnabled(true);
         config2.setBrokerClientTlsEnabled(true);
         config3.setBrokerClientTlsEnabled(true);
@@ -42,9 +42,9 @@ public class ReplicatorTlsTest extends ReplicatorTestBase {
     }
 
     @Override
-    @AfterClass(timeOut = 300000)
-    void shutdown() throws Exception {
-        super.shutdown();
+    @AfterClass(alwaysRun = true, timeOut = 300000)
+    public void cleanup() throws Exception {
+        super.cleanup();
     }
 
     @Test

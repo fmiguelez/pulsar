@@ -100,6 +100,7 @@ public class ProxyWithAuthorizationNegTest extends ProducerConsumerBase {
         conf.setAuthenticationProviders(providers);
 
         conf.setClusterName("proxy-authorization-neg");
+        conf.setNumExecutorThreadPoolSize(5);
 
         super.init();
 
@@ -134,7 +135,7 @@ public class ProxyWithAuthorizationNegTest extends ProducerConsumerBase {
         proxyService.start();
     }
 
-    @AfterMethod
+    @AfterMethod(alwaysRun = true)
     @Override
     protected void cleanup() throws Exception {
         super.internalCleanup();

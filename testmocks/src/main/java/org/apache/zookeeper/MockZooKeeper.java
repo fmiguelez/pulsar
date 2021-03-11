@@ -25,8 +25,9 @@ import com.google.common.collect.Multimaps;
 import com.google.common.collect.SetMultimap;
 import com.google.common.collect.Sets;
 import io.netty.util.concurrent.DefaultThreadFactory;
-import java.lang.reflect.Constructor;
-import java.util.Iterator;
+
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -35,10 +36,12 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiPredicate;
+
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.zookeeper.AsyncCallback.Children2Callback;
 import org.apache.zookeeper.AsyncCallback.ChildrenCallback;
@@ -48,12 +51,16 @@ import org.apache.zookeeper.AsyncCallback.StringCallback;
 import org.apache.zookeeper.AsyncCallback.VoidCallback;
 import org.apache.zookeeper.Watcher.Event.EventType;
 import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.apache.zookeeper.client.HostProvider;
 import org.apache.zookeeper.data.ACL;
 import org.apache.zookeeper.data.Stat;
+import org.objenesis.Objenesis;
+import org.objenesis.ObjenesisStd;
+import org.objenesis.instantiator.ObjectInstantiator;
+import org.powermock.reflect.Whitebox;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-@SuppressWarnings({ "deprecation", "restriction", "rawtypes" })
 public class MockZooKeeper extends ZooKeeper {
     private TreeMap<String, Pair<byte[], Integer>> tree;
     private SetMultimap<String, Watcher> watchers;
@@ -67,6 +74,12 @@ public class MockZooKeeper extends ZooKeeper {
     private int readOpDelayMs;
 
     private ReentrantLock mutex;
+
+    private AtomicLong sequentialIdGenerator;
+
+    //see details of Objenesis caching - http://objenesis.org/details.html
+    //see supported jvms - https://github.com/easymock/objenesis/blob/master/SupportedJVMs.md
+    private static final Objenesis objenesis = new ObjenesisStd();
 
     public enum Op {
         CREATE, GET, SET, GET_CHILDREN, DELETE, EXISTS, SYNC,
@@ -90,16 +103,37 @@ public class MockZooKeeper extends ZooKeeper {
         return newInstance(executor, -1);
     }
 
-    public static MockZooKeeper newInstance(ExecutorService executor, int readOpDelayMs) {
-        try {
+    public static MockZooKeeper newInstanceForGlobalZK(ExecutorService executor) {
+        return newInstanceForGlobalZK(executor, -1);
+    }
 
-            sun.reflect.ReflectionFactory rf = sun.reflect.ReflectionFactory.getReflectionFactory();
-            Constructor objDef = Object.class.getDeclaredConstructor();
-            Constructor intConstr = rf.newConstructorForSerialization(MockZooKeeper.class, objDef);
-            MockZooKeeper zk = (MockZooKeeper) intConstr.newInstance();
+    public static MockZooKeeper newInstanceForGlobalZK(ExecutorService executor, int readOpDelayMs) {
+        try {
+            ObjectInstantiator<MockZooKeeper> mockZooKeeperInstantiator =
+                    new ObjenesisStd().getInstantiatorOf(MockZooKeeper.class);
+            MockZooKeeper zk = (MockZooKeeper) mockZooKeeperInstantiator.newInstance();
             zk.init(executor);
             zk.readOpDelayMs = readOpDelayMs;
             zk.mutex = new ReentrantLock();
+            zk.sequentialIdGenerator =  new AtomicLong();
+            return zk;
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Cannot create object", e);
+        }
+    }
+
+    public static MockZooKeeper newInstance(ExecutorService executor, int readOpDelayMs) {
+        try {
+            ObjectInstantiator<MockZooKeeper> mockZooKeeperInstantiator = objenesis.getInstantiatorOf(MockZooKeeper.class);
+            MockZooKeeper zk = (MockZooKeeper) mockZooKeeperInstantiator.newInstance();
+            zk.init(executor);
+            zk.readOpDelayMs = readOpDelayMs;
+            zk.mutex = new ReentrantLock();
+            ObjectInstantiator<ClientCnxn> clientCnxnObjectInstantiator = objenesis.getInstantiatorOf(ClientCnxn.class);
+            Whitebox.setInternalState(zk, "cnxn", clientCnxnObjectInstantiator.newInstance());
+            zk.sequentialIdGenerator =  new AtomicLong();
             return zk;
         } catch (RuntimeException e) {
             throw e;
@@ -120,6 +154,11 @@ public class MockZooKeeper extends ZooKeeper {
         stopped = false;
         alwaysFail = new AtomicReference<>(KeeperException.Code.OK);
         failures = new CopyOnWriteArrayList<>();
+    }
+
+    @Override
+    public int getSessionTimeout() {
+        return 30_000;
     }
 
     private MockZooKeeper(String quorum) throws Exception {
@@ -225,6 +264,13 @@ public class MockZooKeeper extends ZooKeeper {
                 toNotifyParent.addAll(watchers.get(parent));
             }
 
+            final String name;
+            if (createMode != null && createMode.isSequential()) {
+                name = path + Long.toString(sequentialIdGenerator.getAndIncrement());
+            } else {
+                name = path;
+            }
+
             Optional<KeeperException.Code> failure = programmedFailure(Op.CREATE, path);
             if (failure.isPresent()) {
                 mutex.unlock();
@@ -237,18 +283,20 @@ public class MockZooKeeper extends ZooKeeper {
                 cb.processResult(KeeperException.Code.NODEEXISTS.intValue(), path, ctx, null);
             } else if (!parent.isEmpty() && !tree.containsKey(parent)) {
                 mutex.unlock();
+                toNotifyParent.forEach(watcher -> watcher
+                        .process(new WatchedEvent(EventType.NodeChildrenChanged, KeeperState.SyncConnected, parent)));
                 cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null);
             } else {
-                tree.put(path, Pair.of(data, 0));
-                watchers.removeAll(path);
+                tree.put(name, Pair.of(data, 0));
+                watchers.removeAll(name);
                 mutex.unlock();
-                cb.processResult(0, path, ctx, null);
+                cb.processResult(0, path, ctx, name);
 
                 toNotifyCreate.forEach(
                         watcher -> watcher.process(
                                 new WatchedEvent(EventType.NodeCreated,
                                                  KeeperState.SyncConnected,
-                                                 path)));
+                                                 name)));
                 toNotifyParent.forEach(
                         watcher -> watcher.process(
                                 new WatchedEvent(EventType.NodeChildrenChanged,
@@ -290,7 +338,7 @@ public class MockZooKeeper extends ZooKeeper {
                 cb.processResult(failure.get().intValue(), path, ctx, null, null);
                 return;
             } else if (stopped) {
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null, null);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null, null);
                 return;
             }
 
@@ -303,7 +351,7 @@ public class MockZooKeeper extends ZooKeeper {
             }
 
             if (value == null) {
-                cb.processResult(KeeperException.Code.NoNode, path, ctx, null, null);
+                cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null, null);
             } else {
                 Stat stat = new Stat();
                 stat.setVersion(value.getRight());
@@ -356,13 +404,13 @@ public class MockZooKeeper extends ZooKeeper {
                 return;
             } else if (stopped) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null);
                 return;
             }
 
             if (!tree.containsKey(path)) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.NoNode, path, ctx, null);
+                cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null);
                 return;
             }
 
@@ -475,11 +523,11 @@ public class MockZooKeeper extends ZooKeeper {
                 return;
             } else if (stopped) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null, null);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null, null);
                 return;
             } else if (!tree.containsKey(path)) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.NoNode, path, ctx, null, null);
+                cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null, null);
                 return;
             }
 
@@ -567,7 +615,7 @@ public class MockZooKeeper extends ZooKeeper {
                 return;
             } else if (stopped) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null);
                 return;
             }
 
@@ -576,7 +624,7 @@ public class MockZooKeeper extends ZooKeeper {
                 cb.processResult(0, path, ctx, new Stat());
             } else {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.NoNode, path, ctx, null);
+                cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null);
             }
         });
     }
@@ -592,7 +640,7 @@ public class MockZooKeeper extends ZooKeeper {
                 return;
             } else if (stopped) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null);
                 return;
             }
 
@@ -605,7 +653,7 @@ public class MockZooKeeper extends ZooKeeper {
                 cb.processResult(0, path, ctx, new Stat());
             } else {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.NoNode, path, ctx, null);
+                cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null);
             }
         });
     }
@@ -618,7 +666,7 @@ public class MockZooKeeper extends ZooKeeper {
                 cb.processResult(failure.get().intValue(), path, ctx);
                 return;
             } else if (stopped) {
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx);
                 return;
             }
 
@@ -675,7 +723,7 @@ public class MockZooKeeper extends ZooKeeper {
     @Override
     public void setData(final String path, final byte[] data, int version, final StatCallback cb, final Object ctx) {
         if (stopped) {
-            cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null);
+            cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null);
             return;
         }
 
@@ -691,13 +739,13 @@ public class MockZooKeeper extends ZooKeeper {
                 return;
             } else if (stopped) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.ConnectionLoss, path, ctx, null);
+                cb.processResult(KeeperException.Code.CONNECTIONLOSS.intValue(), path, ctx, null);
                 return;
             }
 
             if (!tree.containsKey(path)) {
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.NoNode, path, ctx, null);
+                cb.processResult(KeeperException.Code.NONODE.intValue(), path, ctx, null);
                 return;
             }
 
@@ -707,7 +755,7 @@ public class MockZooKeeper extends ZooKeeper {
             if (version != -1 && version != currentVersion) {
                 log.debug("[{}] Current version: {} -- Expected: {}", path, currentVersion, version);
                 mutex.unlock();
-                cb.processResult(KeeperException.Code.BadVersion, path, ctx, null);
+                cb.processResult(KeeperException.Code.BADVERSION.intValue(), path, ctx, null);
                 return;
             }
 
@@ -843,6 +891,36 @@ public class MockZooKeeper extends ZooKeeper {
     }
 
     @Override
+    public void multi(Iterable<org.apache.zookeeper.Op> ops, AsyncCallback.MultiCallback cb, Object ctx) {
+        try {
+            List<OpResult> res = multi(ops);
+            cb.processResult(KeeperException.Code.OK.intValue(), (String)null, ctx, res);
+        } catch (Exception e) {
+            cb.processResult(KeeperException.Code.APIERROR.intValue(), (String)null, ctx, null);
+        }
+    }
+
+    @Override
+    public List<OpResult> multi(Iterable<org.apache.zookeeper.Op> ops) throws InterruptedException, KeeperException {
+        List<OpResult> res = new ArrayList<>();
+        for (org.apache.zookeeper.Op op : ops) {
+            switch (op.getType()) {
+                case ZooDefs.OpCode.create:
+                    this.create(op.getPath(), ((org.apache.zookeeper.Op.Create)op).data, null, null);
+                    res.add(new OpResult.CreateResult(op.getPath()));
+                case ZooDefs.OpCode.delete:
+                    this.delete(op.getPath(), -1);
+                    res.add(new OpResult.DeleteResult());
+                case ZooDefs.OpCode.setData:
+                    this.create(op.getPath(), ((org.apache.zookeeper.Op.Create)op).data, null, null);
+                    res.add(new OpResult.SetDataResult(null));
+                default:
+            }
+        }
+        return res;
+    }
+
+    @Override
     public void close() throws InterruptedException {
     }
 
@@ -852,7 +930,12 @@ public class MockZooKeeper extends ZooKeeper {
             stopped = true;
             tree.clear();
             watchers.clear();
-            executor.shutdown();
+            try {
+                executor.shutdownNow();
+                executor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException ex) {
+                log.error("MockZooKeeper shutdown had error", ex);
+            }
         } finally {
             mutex.unlock();
         }

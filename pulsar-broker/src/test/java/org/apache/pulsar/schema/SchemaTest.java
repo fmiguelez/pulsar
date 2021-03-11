@@ -18,26 +18,32 @@
  */
 package org.apache.pulsar.schema;
 
+import static org.apache.pulsar.common.naming.TopicName.PUBLIC_TENANT;
+import static org.apache.pulsar.schema.compatibility.SchemaCompatibilityCheckTest.randomName;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertTrue;
 import com.google.common.collect.Sets;
+import java.util.Collections;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest;
+import org.apache.pulsar.broker.service.schema.SchemaRegistryServiceImpl;
 import org.apache.pulsar.client.api.Consumer;
+import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.Schema;
+import org.apache.pulsar.client.api.schema.GenericRecord;
 import org.apache.pulsar.client.api.schema.SchemaDefinition;
 import org.apache.pulsar.common.naming.TopicDomain;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.TenantInfo;
+import org.apache.pulsar.common.schema.SchemaType;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
-import java.util.Collections;
-
-import static org.apache.pulsar.common.naming.TopicName.PUBLIC_TENANT;
-import static org.apache.pulsar.schema.compatibility.SchemaCompatibilityCheckTest.randomName;
-import static org.junit.Assert.assertEquals;
-
+@Slf4j
 public class SchemaTest extends MockedPulsarServiceBaseTest {
 
     private final static String CLUSTER_NAME = "test";
@@ -54,7 +60,7 @@ public class SchemaTest extends MockedPulsarServiceBaseTest {
         admin.tenants().createTenant(PUBLIC_TENANT, tenantInfo);
     }
 
-    @AfterMethod
+    @AfterMethod(alwaysRun = true)
     @Override
     public void cleanup() throws Exception {
         super.internalCleanup();
@@ -127,10 +133,73 @@ public class SchemaTest extends MockedPulsarServiceBaseTest {
         producer.send(personTwo);
 
         Schemas.PersonTwo personConsume = consumer.receive().getValue();
-        assertEquals("Tom", personConsume.getName());
-        assertEquals(1, personConsume.getId());
+        assertEquals(personConsume.getName(), "Tom");
+        assertEquals(personConsume.getId(), 1);
 
         producer.close();
         consumer.close();
+    }
+
+    @Test
+    public void testBytesSchemaDeserialize() throws Exception {
+        final String tenant = PUBLIC_TENANT;
+        final String namespace = "test-namespace-" + randomName(16);
+        final String topicName = "test-bytes-schema";
+
+        final String topic = TopicName.get(
+                TopicDomain.persistent.value(),
+                tenant,
+                namespace,
+                topicName).toString();
+
+        admin.namespaces().createNamespace(
+                tenant + "/" + namespace,
+                Sets.newHashSet(CLUSTER_NAME));
+
+        admin.topics().createPartitionedTopic(topic, 2);
+        admin.schemas().createSchema(topic, Schema.JSON(Schemas.BytesRecord.class).getSchemaInfo());
+
+        Producer<Schemas.BytesRecord> producer = pulsarClient
+                .newProducer(Schema.JSON(Schemas.BytesRecord.class))
+                .topic(topic)
+                .create();
+
+        Schemas.BytesRecord bytesRecord = new Schemas.BytesRecord();
+        bytesRecord.setId(1);
+        bytesRecord.setName("Tom");
+        bytesRecord.setAddress("test".getBytes());
+
+        Consumer<GenericRecord> consumer = pulsarClient.newConsumer(Schema.AUTO_CONSUME())
+                .subscriptionName("test-sub")
+                .topic(topic)
+                .subscribe();
+
+        Consumer<Schemas.BytesRecord> consumer1 = pulsarClient.newConsumer(Schema.JSON(Schemas.BytesRecord.class))
+                .subscriptionName("test-sub1")
+                .topic(topic)
+                .subscribe();
+
+        producer.send(bytesRecord);
+
+        Message<GenericRecord> message = consumer.receive();
+        Message<Schemas.BytesRecord> message1 = consumer1.receive();
+
+        assertEquals(message.getValue().getField("address").getClass(),
+                message1.getValue().getAddress().getClass());
+
+        producer.close();
+        consumer.close();
+        consumer1.close();
+    }
+
+    @Test
+    public void testIsUsingAvroSchemaParser() {
+        for (SchemaType value : SchemaType.values()) {
+            if (value == SchemaType.AVRO || value == SchemaType.JSON || value == SchemaType.PROTOBUF) {
+                assertTrue(SchemaRegistryServiceImpl.isUsingAvroSchemaParser(value));
+            } else {
+                assertFalse(SchemaRegistryServiceImpl.isUsingAvroSchemaParser(value));
+            }
+        }
     }
 }

@@ -76,13 +76,13 @@ public class ProxyForwardAuthDataTest extends ProducerConsumerBase {
     }
 
     @Override
-    @AfterMethod
+    @AfterMethod(alwaysRun = true)
     protected void cleanup() throws Exception {
         super.internalCleanup();
     }
 
     @Test
-    void testForwardAuthData() throws Exception {
+    public void testForwardAuthData() throws Exception {
         log.info("-- Starting {} test --", methodName);
 
         // Step 1: Create Admin Client

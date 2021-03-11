@@ -18,12 +18,11 @@
  */
 package org.apache.bookkeeper.mledger;
 
-import com.google.common.annotations.Beta;
 import io.netty.buffer.ByteBuf;
-
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-
+import org.apache.bookkeeper.common.annotation.InterfaceAudience;
+import org.apache.bookkeeper.common.annotation.InterfaceStability;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.AddEntryCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.CloseCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.DeleteCursorCallback;
@@ -31,7 +30,9 @@ import org.apache.bookkeeper.mledger.AsyncCallbacks.DeleteLedgerCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.OffloadCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.OpenCursorCallback;
 import org.apache.bookkeeper.mledger.AsyncCallbacks.TerminateCallback;
-import org.apache.pulsar.common.api.proto.PulsarApi.CommandSubscribe.InitialPosition;
+import org.apache.bookkeeper.mledger.intercept.ManagedLedgerInterceptor;
+import org.apache.bookkeeper.mledger.proto.MLDataFormats.ManagedLedgerInfo.LedgerInfo;
+import org.apache.pulsar.common.api.proto.CommandSubscribe.InitialPosition;
 
 /**
  * A ManagedLedger it's a superset of a BookKeeper ledger concept.
@@ -54,7 +55,8 @@ import org.apache.pulsar.common.api.proto.PulsarApi.CommandSubscribe.InitialPosi
  * coordination.</li>
  * </ul>
  */
-@Beta
+@InterfaceAudience.LimitedPrivate
+@InterfaceStability.Stable
 public interface ManagedLedger {
 
     /**
@@ -71,6 +73,18 @@ public interface ManagedLedger {
      * @throws ManagedLedgerException
      */
     Position addEntry(byte[] data) throws InterruptedException, ManagedLedgerException;
+
+    /**
+     * Append a new entry to the end of a managed ledger.
+     *
+     * @param data
+     *            data entry to be persisted
+     * @param numberOfMessages
+     *            numberOfMessages of entry
+     * @return the Position at which the entry has been inserted
+     * @throws ManagedLedgerException
+     */
+    Position addEntry(byte[] data, int numberOfMessages) throws InterruptedException, ManagedLedgerException;
 
     /**
      * Append a new entry asynchronously.
@@ -101,6 +115,22 @@ public interface ManagedLedger {
     Position addEntry(byte[] data, int offset, int length) throws InterruptedException, ManagedLedgerException;
 
     /**
+     * Append a new entry to the end of a managed ledger.
+     *
+     * @param data
+     *            data entry to be persisted
+     * @param numberOfMessages
+     *            numberOfMessages of entry
+     * @param offset
+     *            offset in the data array
+     * @param length
+     *            number of bytes
+     * @return the Position at which the entry has been inserted
+     * @throws ManagedLedgerException
+     */
+    Position addEntry(byte[] data, int numberOfMessages, int offset, int length) throws InterruptedException, ManagedLedgerException;
+
+    /**
      * Append a new entry asynchronously.
      *
      * @see #addEntry(byte[])
@@ -121,6 +151,26 @@ public interface ManagedLedger {
      * Append a new entry asynchronously.
      *
      * @see #addEntry(byte[])
+     * @param data
+     *            data entry to be persisted
+     * @param numberOfMessages
+     *            numberOfMessages of entry
+     * @param offset
+     *            offset in the data array
+     * @param length
+     *            number of bytes
+     * @param callback
+     *            callback object
+     * @param ctx
+     *            opaque context
+     */
+    void asyncAddEntry(byte[] data, int numberOfMessages, int offset, int length, AddEntryCallback callback, Object ctx);
+
+
+    /**
+     * Append a new entry asynchronously.
+     *
+     * @see #addEntry(byte[])
      * @param buffer
      *            buffer with the data entry
      * @param callback
@@ -129,6 +179,21 @@ public interface ManagedLedger {
      *            opaque context
      */
     void asyncAddEntry(ByteBuf buffer, AddEntryCallback callback, Object ctx);
+
+    /**
+     * Append a new entry asynchronously.
+     *
+     * @see #addEntry(byte[])
+     * @param buffer
+     *            buffer with the data entry
+     * @param numberOfMessages
+     *            numberOfMessages for data entry
+     * @param callback
+     *            callback object
+     * @param ctx
+     *            opaque context
+     */
+    void asyncAddEntry(ByteBuf buffer, int numberOfMessages, AddEntryCallback callback, Object ctx);
 
     /**
      * Open a ManagedCursor in this ManagedLedger.
@@ -193,6 +258,7 @@ public interface ManagedLedger {
      */
     ManagedCursor newNonDurableCursor(Position startCursorPosition) throws ManagedLedgerException;
     ManagedCursor newNonDurableCursor(Position startPosition, String subscriptionName) throws ManagedLedgerException;
+    ManagedCursor newNonDurableCursor(Position startPosition, String subscriptionName, InitialPosition initialPosition) throws ManagedLedgerException;
 
     /**
      * Delete a ManagedCursor asynchronously.
@@ -451,11 +517,51 @@ public interface ManagedLedger {
     Map<String, String> getProperties();
 
     /**
+     * Add key-value to propertiesMap.
+     *
+     * @param key key of property to add
+     * @param value value of property to add
+     * @throws InterruptedException
+     * @throws ManagedLedgerException
+     */
+    void setProperty(String key, String value) throws InterruptedException, ManagedLedgerException;
+
+    /**
+     * Async add key-value to propertiesMap.
+     *
+     * @param key      key of property to add
+     * @param value    value of property to add
+     * @param callback a callback which will be supplied with the newest properties in managedLedger.
+     * @param ctx      a context object which will be passed to the callback on completion.
+     **/
+    void asyncSetProperty(String key, String value, final AsyncCallbacks.UpdatePropertiesCallback callback, Object ctx);
+
+    /**
+     * Delete the property by key.
+     *
+     * @param key key of property to delete
+     * @throws InterruptedException
+     * @throws ManagedLedgerException
+     */
+    void deleteProperty(String key) throws InterruptedException, ManagedLedgerException;
+
+    /**
+     * Async delete the property by key.
+     *
+     * @param key      key of property to delete
+     * @param callback a callback which will be supplied with the newest properties in managedLedger.
+     * @param ctx      a context object which will be passed to the callback on completion.
+     */
+    void asyncDeleteProperty(String key, final AsyncCallbacks.UpdatePropertiesCallback callback, Object ctx);
+
+    /**
      * Update managed-ledger's properties.
      *
      * @param properties key-values of properties
+     * @throws InterruptedException
+     * @throws ManagedLedgerException
      */
-    void setProperties(Map<String, String> properties) throws InterruptedException;
+    void setProperties(Map<String, String> properties) throws InterruptedException, ManagedLedgerException;
 
     /**
      * Async update managed-ledger's properties.
@@ -464,9 +570,9 @@ public interface ManagedLedger {
      * @param callback   a callback which will be supplied with the newest properties in managedLedger.
      * @param ctx        a context object which will be passed to the callback on completion.
      */
-    void asyncSetProperties(Map<String, String> properties, final AsyncCallbacks.SetPropertiesCallback callback,
+    void asyncSetProperties(Map<String, String> properties, final AsyncCallbacks.UpdatePropertiesCallback callback,
         Object ctx);
-  
+
     /**
      * Trim consumed ledgers in background
      * @param promise
@@ -476,5 +582,22 @@ public interface ManagedLedger {
     /**
      * Roll current ledger if it is full
      */
+    @Deprecated
     void rollCurrentLedgerIfFull();
+
+    /**
+     * Find position by sequenceId.
+     * */
+    CompletableFuture<Position> asyncFindPosition(com.google.common.base.Predicate<Entry> predicate);
+
+    /**
+     * Get the ManagedLedgerInterceptor for ManagedLedger.
+     * */
+    ManagedLedgerInterceptor getManagedLedgerInterceptor();
+
+    /**
+     * Get basic ledger summary.
+     * will got null if corresponding ledger not exists.
+     */
+    CompletableFuture<LedgerInfo> getLedgerInfo(long ledgerId);
 }

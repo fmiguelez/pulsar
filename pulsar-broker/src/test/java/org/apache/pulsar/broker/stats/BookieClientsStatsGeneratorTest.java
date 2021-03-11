@@ -43,7 +43,7 @@ public class BookieClientsStatsGeneratorTest extends BrokerTestBase {
         super.baseSetup();
     }
 
-    @AfterClass
+    @AfterClass(alwaysRun = true)
     @Override
     protected void cleanup() throws Exception {
         super.internalCleanup();
@@ -57,7 +57,7 @@ public class BookieClientsStatsGeneratorTest extends BrokerTestBase {
     }
 
     @Test
-    public void testJvmDirectMemoryUsedMetric() throws Exception {
+    public void testJvmDirectMemoryUsedMetric() {
         PooledByteBufAllocator allocator = new PooledByteBufAllocator( //
                 true, // preferDirect
                 0, // nHeapArenas,

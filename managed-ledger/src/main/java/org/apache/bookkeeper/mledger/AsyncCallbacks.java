@@ -18,16 +18,20 @@
  */
 package org.apache.bookkeeper.mledger;
 
-import com.google.common.annotations.Beta;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+
+import io.netty.buffer.ByteBuf;
+import org.apache.bookkeeper.common.annotation.InterfaceAudience;
+import org.apache.bookkeeper.common.annotation.InterfaceStability;
 
 /**
  * Definition of all the callbacks used for the ManagedLedger asynchronous API.
  *
  */
-@Beta
+@InterfaceAudience.LimitedPrivate
+@InterfaceStability.Stable
 @SuppressWarnings("checkstyle:javadoctype")
 public interface AsyncCallbacks {
 
@@ -62,7 +66,7 @@ public interface AsyncCallbacks {
     }
 
     interface AddEntryCallback {
-        void addComplete(Position position, Object ctx);
+        void addComplete(Position position, ByteBuf entryData, Object ctx);
 
         void addFailed(ManagedLedgerException exception, Object ctx);
     }
@@ -139,9 +143,9 @@ public interface AsyncCallbacks {
         void offloadFailed(ManagedLedgerException exception, Object ctx);
     }
 
-    interface SetPropertiesCallback {
-        void setPropertiesComplete(Map<String, String> properties, Object ctx);
+    interface UpdatePropertiesCallback {
+        void updatePropertiesComplete(Map<String, String> properties, Object ctx);
 
-        void setPropertiesFailed(ManagedLedgerException exception, Object ctx);
+        void updatePropertiesFailed(ManagedLedgerException exception, Object ctx);
     }
 }

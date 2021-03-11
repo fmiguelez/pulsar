@@ -22,29 +22,27 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static org.apache.commons.lang3.StringUtils.isNotBlank;
 import static org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest.retryStrategically;
 import static org.apache.pulsar.functions.utils.functioncache.FunctionCacheEntry.JAVA_INSTANCE_JAR_PROPERTY;
+import static org.apache.pulsar.functions.worker.PulsarFunctionLocalRunTest.getPulsarApiExamplesJar;
+import static org.apache.pulsar.functions.worker.PulsarFunctionLocalRunTest.getPulsarIOBatchDataGeneratorNar;
+import static org.apache.pulsar.functions.worker.PulsarFunctionLocalRunTest.getPulsarIODataGeneratorNar;
 import static org.mockito.Mockito.spy;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
-
+import static org.testng.Assert.fail;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.sun.net.httpserver.Headers;
-import com.sun.net.httpserver.HttpServer;
-
-import java.io.BufferedInputStream;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
-import java.net.InetSocketAddress;
 import java.net.URL;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -53,13 +51,14 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
+import lombok.Cleanup;
 import lombok.ToString;
-
+import org.apache.commons.io.FileUtils;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.ServiceConfigurationUtils;
@@ -73,6 +72,7 @@ import org.apache.pulsar.client.api.Authentication;
 import org.apache.pulsar.client.api.ClientBuilder;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.MessageRoutingMode;
 import org.apache.pulsar.client.api.Producer;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.Schema;
@@ -80,6 +80,7 @@ import org.apache.pulsar.client.impl.auth.AuthenticationTls;
 import org.apache.pulsar.common.functions.ConsumerConfig;
 import org.apache.pulsar.common.functions.FunctionConfig;
 import org.apache.pulsar.common.functions.Utils;
+import org.apache.pulsar.common.io.BatchSourceConfig;
 import org.apache.pulsar.common.io.SinkConfig;
 import org.apache.pulsar.common.io.SourceConfig;
 import org.apache.pulsar.common.policies.data.ClusterData;
@@ -90,15 +91,20 @@ import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.apache.pulsar.common.policies.data.TopicStats;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.common.util.ObjectMapperFactory;
+import org.apache.pulsar.compaction.TwoPhaseCompactor;
 import org.apache.pulsar.functions.LocalRunner;
 import org.apache.pulsar.functions.instance.InstanceUtils;
 import org.apache.pulsar.functions.runtime.thread.ThreadRuntimeFactory;
-import org.apache.pulsar.functions.utils.FunctionCommon;
-import org.apache.pulsar.functions.worker.FunctionRuntimeManager;
 import org.apache.pulsar.functions.runtime.thread.ThreadRuntimeFactoryConfig;
+import org.apache.pulsar.functions.utils.FunctionCommon;
+import org.apache.pulsar.functions.worker.FileServer;
+import org.apache.pulsar.functions.worker.FunctionRuntimeManager;
+import org.apache.pulsar.functions.worker.PulsarWorkerService;
 import org.apache.pulsar.functions.worker.WorkerConfig;
 import org.apache.pulsar.functions.worker.WorkerService;
+import org.apache.pulsar.io.batchdiscovery.ImmediateTriggerer;
 import org.apache.pulsar.zookeeper.LocalBookkeeperEnsemble;
+import org.awaitility.Awaitility;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.testng.Assert;
@@ -120,7 +126,7 @@ public class PulsarFunctionE2ETest {
     PulsarAdmin admin;
     PulsarClient pulsarClient;
     BrokerStats brokerStatsClient;
-    WorkerService functionsWorkerService;
+    PulsarWorkerService functionsWorkerService;
     final String tenant = "external-repl-prop";
     String pulsarFunctionsNamespace = tenant + "/pulsar-function-admin";
     String primaryHost;
@@ -133,8 +139,7 @@ public class PulsarFunctionE2ETest {
     private final String TLS_TRUST_CERT_FILE_PATH = "./src/test/resources/authentication/tls/cacert.pem";
 
     private static final Logger log = LoggerFactory.getLogger(PulsarFunctionE2ETest.class);
-    private Thread fileServerThread;
-    private HttpServer fileServer;
+    private FileServer fileServer;
 
     @DataProvider(name = "validRoleName")
     public Object[][] validRoleName() {
@@ -160,7 +165,7 @@ public class PulsarFunctionE2ETest {
 
         config = spy(new ServiceConfiguration());
         config.setClusterName("use");
-        Set<String> superUsers = Sets.newHashSet("superUser");
+        Set<String> superUsers = Sets.newHashSet("superUser", "admin");
         config.setSuperUserRoles(superUsers);
         config.setWebServicePort(Optional.of(0));
         config.setWebServicePortTls(Optional.of(0));
@@ -190,9 +195,32 @@ public class PulsarFunctionE2ETest {
         config.setBrokerClientTlsEnabled(true);
         config.setAllowAutoTopicCreationType("non-partitioned");
 
+        System.setProperty(JAVA_INSTANCE_JAR_PROPERTY,
+                FutureUtil.class.getProtectionDomain().getCodeSource().getLocation().getPath());
+
         functionsWorkerService = createPulsarFunctionWorker(config);
+
+        // populate builtin connectors folder
+        if (Arrays.asList(method.getAnnotation(Test.class).groups()).contains("builtin")) {
+            File connectorsDir = new File(workerConfig.getConnectorsDirectory());
+
+            if (connectorsDir.exists()) {
+                FileUtils.deleteDirectory(connectorsDir);
+            }
+
+            if (connectorsDir.mkdir()) {
+                File file = getPulsarIODataGeneratorNar();
+                Files.copy(file.toPath(), new File(connectorsDir.getAbsolutePath() + "/" + file.getName()).toPath());
+
+                file = getPulsarIOBatchDataGeneratorNar();
+                Files.copy(file.toPath(), new File(connectorsDir.getAbsolutePath() + "/" + file.getName()).toPath());
+            } else {
+                throw new RuntimeException("Failed to create builtin connectors directory");
+            }
+        }
+
         Optional<WorkerService> functionWorkerService = Optional.of(functionsWorkerService);
-        pulsar = new PulsarService(config, functionWorkerService, (exitCode) -> {});
+        pulsar = new PulsarService(config, workerConfig, functionWorkerService, (exitCode) -> {});
         pulsar.start();
 
         Map<String, String> authParams = new HashMap<>();
@@ -214,12 +242,12 @@ public class PulsarFunctionE2ETest {
         admin.clusters().updateCluster(config.getClusterName(), clusterData);
 
         ClientBuilder clientBuilder = PulsarClient.builder().serviceUrl(this.workerConfig.getPulsarServiceUrl());
-        if (isNotBlank(workerConfig.getClientAuthenticationPlugin())
-                && isNotBlank(workerConfig.getClientAuthenticationParameters())) {
+        if (isNotBlank(workerConfig.getBrokerClientAuthenticationPlugin())
+                && isNotBlank(workerConfig.getBrokerClientAuthenticationParameters())) {
             clientBuilder.enableTls(workerConfig.isUseTls());
             clientBuilder.allowTlsInsecureConnection(workerConfig.isTlsAllowInsecureConnection());
-            clientBuilder.authentication(workerConfig.getClientAuthenticationPlugin(),
-                    workerConfig.getClientAuthenticationParameters());
+            clientBuilder.authentication(workerConfig.getBrokerClientAuthenticationPlugin(),
+                    workerConfig.getBrokerClientAuthenticationParameters());
         }
         pulsarClient = clientBuilder.build();
 
@@ -228,81 +256,40 @@ public class PulsarFunctionE2ETest {
         propAdmin.setAllowedClusters(Sets.newHashSet(Lists.newArrayList("use")));
         admin.tenants().updateTenant(tenant, propAdmin);
 
-        // setting up simple web sever to test submitting function via URL
-        CountDownLatch latch = new CountDownLatch(1);
-        fileServerThread = new Thread(() -> {
-            try {
-                fileServer = HttpServer.create(new InetSocketAddress(0), 0);
-                fileServer.createContext("/pulsar-io-data-generator.nar", he -> {
-                    try {
+        assertTrue(getPulsarIODataGeneratorNar().exists(), "pulsar-io-data-generator.nar file "
+                + getPulsarIODataGeneratorNar().getAbsolutePath() + " doesn't exist.");
+        assertTrue(getPulsarIOBatchDataGeneratorNar().exists(), "pulsar-io-batch-data-generator.nar file "
+                + getPulsarIOBatchDataGeneratorNar().getAbsolutePath() + " doesn't exist.");
+        assertTrue(getPulsarApiExamplesJar().exists(), "pulsar-functions-api-examples.jar file "
+                + getPulsarApiExamplesJar().getAbsolutePath() + " doesn't exist.");
 
-                        Headers headers = he.getResponseHeaders();
-                        headers.add("Content-Type", "application/octet-stream");
+        // setting up simple web server to test submitting function via URL
+        fileServer = new FileServer();
+        fileServer.serveFile("/pulsar-io-data-generator.nar", getPulsarIODataGeneratorNar());
+        fileServer.serveFile("/pulsar-io-batch-data-generator.nar", getPulsarIOBatchDataGeneratorNar());
+        fileServer.serveFile("/pulsar-functions-api-examples.jar", getPulsarApiExamplesJar());
+        fileServer.start();
 
-                        File file = new File(getClass().getClassLoader().getResource("pulsar-io-data-generator.nar").getFile());
-                        byte[] bytes  = new byte [(int)file.length()];
-
-                        FileInputStream fileInputStream = new FileInputStream(file);
-                        BufferedInputStream bufferedInputStream = new BufferedInputStream(fileInputStream);
-                        bufferedInputStream.read(bytes, 0, bytes.length);
-
-                        he.sendResponseHeaders(200, file.length());
-                        OutputStream outputStream = he.getResponseBody();
-                        outputStream.write(bytes, 0, bytes.length);
-                        outputStream.close();
-
-                    } catch (Exception e) {
-                        log.error("Error when downloading: {}", e, e);
-                    }
-                });
-                fileServer.createContext("/pulsar-functions-api-examples.jar", he -> {
-                    try {
-
-                        Headers headers = he.getResponseHeaders();
-                        headers.add("Content-Type", "application/octet-stream");
-
-                        File file = new File(getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile());
-                        byte[] bytes  = new byte [(int)file.length()];
-
-                        FileInputStream fileInputStream = new FileInputStream(file);
-                        BufferedInputStream bufferedInputStream = new BufferedInputStream(fileInputStream);
-                        bufferedInputStream.read(bytes, 0, bytes.length);
-
-                        he.sendResponseHeaders(200, file.length());
-                        OutputStream outputStream = he.getResponseBody();
-                        outputStream.write(bytes, 0, bytes.length);
-                        outputStream.close();
-
-                    } catch (Exception e) {
-                        log.error("Error when downloading: {}", e, e);
-                    }
-                });
-                fileServer.setExecutor(null); // creates a default executor
-                log.info("Starting file server...");
-                fileServer.start();
-            } catch (Exception e) {
-                log.error("Failed to start file server: ", e);
-                fileServer.stop(0);
-            }
-            latch.countDown();
-        });
-        fileServerThread.start();
-        latch.await(1, TimeUnit.SECONDS);
+        Awaitility.await().until(() -> functionsWorkerService.getLeaderService().isLeader());
     }
 
-    @AfterMethod
+    @AfterMethod(alwaysRun = true)
     void shutdown() throws Exception {
         log.info("--- Shutting down ---");
-        fileServer.stop(0);
-        fileServerThread.interrupt();
+        fileServer.stop();
         pulsarClient.close();
         admin.close();
         functionsWorkerService.stop();
         pulsar.close();
         bkEnsemble.stop();
+
+        File connectorsDir = new File(workerConfig.getConnectorsDirectory());
+        if (connectorsDir.exists()) {
+            FileUtils.deleteDirectory(connectorsDir);
+        }
     }
 
-    private WorkerService createPulsarFunctionWorker(ServiceConfiguration config) {
+    private PulsarWorkerService createPulsarFunctionWorker(ServiceConfiguration config) throws IOException {
 
         System.setProperty(JAVA_INSTANCE_JAR_PROPERTY,
                 FutureUtil.class.getProtectionDomain().getCodeSource().getLocation().getPath());
@@ -327,8 +314,8 @@ public class PulsarFunctionE2ETest {
         workerConfig.setWorkerHostname(hostname);
         workerConfig.setWorkerId(workerId);
 
-        workerConfig.setClientAuthenticationPlugin(AuthenticationTls.class.getName());
-        workerConfig.setClientAuthenticationParameters(
+        workerConfig.setBrokerClientAuthenticationPlugin(AuthenticationTls.class.getName());
+        workerConfig.setBrokerClientAuthenticationParameters(
                 String.format("tlsCertFile:%s,tlsKeyFile:%s", TLS_CLIENT_CERT_FILE_PATH, TLS_CLIENT_KEY_FILE_PATH));
         workerConfig.setUseTls(true);
         workerConfig.setTlsAllowInsecureConnection(true);
@@ -337,7 +324,11 @@ public class PulsarFunctionE2ETest {
         workerConfig.setAuthenticationEnabled(true);
         workerConfig.setAuthorizationEnabled(true);
 
-        return new WorkerService(workerConfig);
+        workerConfig.setConnectorsDirectory(Files.createTempDirectory("tempconnectorsdir").toFile().getAbsolutePath());
+
+        PulsarWorkerService workerService = new PulsarWorkerService();
+        workerService.init(workerConfig, null, false);
+        return workerService;
     }
 
     protected static FunctionConfig createFunctionConfig(String tenant, String namespace, String functionName, String sourceTopic, String sinkTopic, String subscriptionName) {
@@ -382,6 +373,13 @@ public class PulsarFunctionE2ETest {
         sinkConfig.setCleanupSubscription(true);
         return sinkConfig;
     }
+
+    private static BatchSourceConfig createBatchSourceConfig() {
+        return BatchSourceConfig.builder()
+                 .discoveryTriggererClassName(ImmediateTriggerer.class.getName())
+                 .build();
+    }
+
     /**
      * Validates pulsar sink e2e functionality on functions.
      *
@@ -416,47 +414,30 @@ public class PulsarFunctionE2ETest {
         functionConfig.setOutput(sinkTopic2);
         admin.functions().updateFunctionWithUrl(functionConfig, jarFilePathUrl);
 
-        retryStrategically((test) -> {
-            try {
-                TopicStats topicStats = admin.topics().getStats(sinkTopic2);
-                return topicStats.publishers.size() == 2
-                        && topicStats.publishers.get(0).metadata != null
-                        && topicStats.publishers.get(0).metadata.containsKey("id")
-                        && topicStats.publishers.get(0).metadata.get("id").equals(String.format("%s/%s/%s", tenant, namespacePortion, functionName));
-            } catch (PulsarAdminException e) {
-                return false;
-            }
-        }, 50, 150);
+        Awaitility.await().ignoreExceptions().untilAsserted(() -> {
+            TopicStats topicStats = admin.topics().getStats(sinkTopic2);
+            assertEquals(topicStats.publishers.size(), 2);
+            assertNotNull(topicStats.publishers.get(0).metadata);
+            assertTrue(topicStats.publishers.get(0).metadata.containsKey("id"));
+            assertEquals(topicStats.publishers.get(0).metadata.get("id"),
+                    String.format("%s/%s/%s", tenant, namespacePortion, functionName));
+        });
 
-        TopicStats topicStats = admin.topics().getStats(sinkTopic2);
-        assertEquals(topicStats.publishers.size(), 2);
-        assertNotNull(topicStats.publishers.get(0).metadata);
-        assertTrue(topicStats.publishers.get(0).metadata.containsKey("id"));
-        assertEquals(topicStats.publishers.get(0).metadata.get("id"), String.format("%s/%s/%s", tenant, namespacePortion, functionName));
-
-        retryStrategically((test) -> {
-            try {
-                return admin.topics().getStats(sourceTopic).subscriptions.size() == 1;
-            } catch (PulsarAdminException e) {
-                return false;
-            }
-        }, 50, 150);
-        // validate pulsar sink consumer has started on the topic
-        assertEquals(admin.topics().getStats(sourceTopic).subscriptions.size(), 1);
+        Awaitility.await().ignoreExceptions().untilAsserted(() -> {
+            // validate pulsar sink consumer has started on the topic
+            assertEquals(admin.topics().getStats(sourceTopic).subscriptions.size(), 1);
+        });
 
         int totalMsgs = 5;
         for (int i = 0; i < totalMsgs; i++) {
             String data = "my-message-" + i;
             producer.newMessage().property(propertyKey, propertyValue).value(data).send();
         }
-        retryStrategically((test) -> {
-            try {
-                SubscriptionStats subStats = admin.topics().getStats(sourceTopic).subscriptions.get(subscriptionName);
-                return subStats.unackedMessages == 0;
-            } catch (PulsarAdminException e) {
-                return false;
-            }
-        }, 50, 150);
+
+        Awaitility.await().ignoreExceptions().untilAsserted(() -> {
+            SubscriptionStats subStats = admin.topics().getStats(sourceTopic).subscriptions.get(subscriptionName);
+            assertEquals(subStats.unackedMessages, 0);
+        });
 
         Message<String> msg = consumer.receive(5, TimeUnit.SECONDS);
         String receivedPropertyValue = msg.getProperty(propertyKey);
@@ -470,16 +451,10 @@ public class PulsarFunctionE2ETest {
         // delete functions
         admin.functions().deleteFunction(tenant, namespacePortion, functionName);
 
-        retryStrategically((test) -> {
-            try {
-                return admin.topics().getStats(sourceTopic).subscriptions.size() == 0;
-            } catch (PulsarAdminException e) {
-                return false;
-            }
-        }, 50, 150);
-
-        // make sure subscriptions are cleanup
-        assertEquals(admin.topics().getStats(sourceTopic).subscriptions.size(), 0);
+        Awaitility.await().ignoreExceptions().untilAsserted(() -> {
+            // make sure subscriptions are cleanup
+            assertEquals(admin.topics().getStats(sourceTopic).subscriptions.size(), 0);
+        });
 
         // make sure all temp files are deleted
         File dir = new File(System.getProperty("java.io.tmpdir"));
@@ -490,15 +465,142 @@ public class PulsarFunctionE2ETest {
 
     @Test(timeOut = 20000)
     public void testE2EPulsarFunctionWithFile() throws Exception {
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
         testE2EPulsarFunction(jarFilePathUrl);
     }
 
     @Test(timeOut = 40000)
     public void testE2EPulsarFunctionWithUrl() throws Exception {
-        String jarFilePathUrl = String.format("http://127.0.0.1:%d/pulsar-functions-api-examples.jar",
-                fileServer.getAddress().getPort());
-        testE2EPulsarFunction(jarFilePathUrl);
+        testE2EPulsarFunction(fileServer.getUrl("/pulsar-functions-api-examples.jar"));
+    }
+
+    @Test(timeOut = 30000)
+    public void testReadCompactedFunction() throws Exception {
+        final String namespacePortion = "io";
+        final String replNamespace = tenant + "/" + namespacePortion;
+        final String sourceTopic = "persistent://" + replNamespace + "/my-topic1";
+        final String sinkTopic = "persistent://" + replNamespace + "/output";
+        final String functionName = "PulsarFunction-test";
+        final String subscriptionName = "test-sub";
+        admin.namespaces().createNamespace(replNamespace);
+        Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
+        admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
+        final int messageNum = 20;
+        final int maxKeys = 10;
+        // 1 Setup producer
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING)
+                .topic(sourceTopic)
+                .enableBatching(false)
+                .messageRoutingMode(MessageRoutingMode.SinglePartition)
+                .create();
+        pulsarClient.newConsumer().topic(sourceTopic).subscriptionName(subscriptionName).readCompacted(true).subscribe().close();
+        // 2 Send messages and record the expected values after compaction
+        Map<String, String> expected = new HashMap<>();
+        for (int j = 0; j < messageNum; j++) {
+            String key = "key" + j % maxKeys;
+            String value = "my-message-" + key + j;
+            producer.newMessage().key(key).value(value).send();
+            //Duplicate keys will exist, the value of the new key will be retained
+            expected.put(key, value);
+        }
+        // 3 Trigger compaction
+        ScheduledExecutorService compactionScheduler = Executors.newSingleThreadScheduledExecutor(
+                new ThreadFactoryBuilder().setNameFormat("compactor").setDaemon(true).build());
+        TwoPhaseCompactor twoPhaseCompactor = new TwoPhaseCompactor(config,
+                pulsarClient, pulsar.getBookKeeperClient(), compactionScheduler);
+        twoPhaseCompactor.compact(sourceTopic).get();
+
+        // 4 Setup function
+        FunctionConfig functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
+                sourceTopic, sinkTopic, subscriptionName);
+        Map<String, ConsumerConfig> inputSpecs = new HashMap<>();
+        ConsumerConfig consumerConfig = new ConsumerConfig();
+        Map<String,String> consumerProperties = new HashMap<>();
+        consumerProperties.put("readCompacted","true");
+        consumerConfig.setConsumerProperties(consumerProperties);
+        inputSpecs.put(sourceTopic, consumerConfig);
+        functionConfig.setInputSpecs(inputSpecs);
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
+        admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
+
+        // 5 Function should only read compacted value，so we will only receive compacted messages
+        Consumer<String> consumer = pulsarClient.newConsumer(Schema.STRING).topic(sinkTopic).subscriptionName("sink-sub").subscribe();
+        int count = 0;
+        while (true) {
+            Message<String> message = consumer.receive(10, TimeUnit.SECONDS);
+            if (message == null) {
+                break;
+            }
+            consumer.acknowledge(message);
+            count++;
+            Assert.assertEquals(expected.remove(message.getKey()) + "!", message.getValue());
+        }
+        Assert.assertEquals(count, maxKeys);
+        Assert.assertTrue(expected.isEmpty());
+
+        compactionScheduler.shutdownNow();
+        consumer.close();
+        producer.close();
+    }
+
+    @Test
+    public void testReadCompactedSink() throws Exception {
+        final String namespacePortion = "io";
+        final String replNamespace = tenant + "/" + namespacePortion;
+        final String sourceTopic = "persistent://" + replNamespace + "/my-topic2";
+        final String sinkName = "PulsarFunction-test";
+        final String subscriptionName = "test-sub";
+        admin.namespaces().createNamespace(replNamespace);
+        Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
+        admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
+        final int messageNum = 20;
+        final int maxKeys = 10;
+        // 1 Setup producer
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING)
+                .topic(sourceTopic)
+                .enableBatching(false)
+                .messageRoutingMode(MessageRoutingMode.SinglePartition)
+                .create();
+        pulsarClient.newConsumer().topic(sourceTopic).subscriptionName(subscriptionName).readCompacted(true).subscribe().close();
+        // 2 Send messages and record the expected values after compaction
+        Map<String, String> expected = new HashMap<>();
+        for (int j = 0; j < messageNum; j++) {
+            String key = "key" + j % maxKeys;
+            String value = "my-message-" + key + j;
+            producer.newMessage().key(key).value(value).send();
+            //Duplicate keys will exist, the value of the new key will be retained
+            expected.put(key, value);
+        }
+        // 3 Trigger compaction
+        ScheduledExecutorService compactionScheduler = Executors.newSingleThreadScheduledExecutor(
+                new ThreadFactoryBuilder().setNameFormat("compactor").setDaemon(true).build());
+        TwoPhaseCompactor twoPhaseCompactor = new TwoPhaseCompactor(config,
+                pulsarClient, pulsar.getBookKeeperClient(), compactionScheduler);
+        twoPhaseCompactor.compact(sourceTopic).get();
+
+        // 4 Setup sink
+        SinkConfig sinkConfig = createSinkConfig(tenant, namespacePortion, sinkName, sourceTopic, subscriptionName);
+        sinkConfig.setProcessingGuarantees(FunctionConfig.ProcessingGuarantees.EFFECTIVELY_ONCE);
+        Map<String,String> consumerProperties = new HashMap<>();
+        consumerProperties.put("readCompacted","true");
+        sinkConfig.setInputSpecs(Collections.singletonMap(sourceTopic, ConsumerConfig.builder().consumerProperties(consumerProperties).build()));
+        String jarFilePathUrl = getPulsarIODataGeneratorNar().toURI().toString();
+        admin.sink().createSinkWithUrl(sinkConfig, jarFilePathUrl);
+
+        // 5 Sink should only read compacted value，so we will only receive compacted messages
+        retryStrategically((test) -> {
+            try {
+                String prometheusMetrics = getPrometheusMetrics(pulsar.getListenPortHTTP().get());
+                Map<String, Metric> metrics = parseMetrics(prometheusMetrics);
+                Metric m = metrics.get("pulsar_sink_received_total");
+                return m.value == (double) maxKeys;
+            } catch (Exception e) {
+                return false;
+            }
+        }, 50, 1000);
+
+        compactionScheduler.shutdownNow();
+        producer.close();
     }
 
     @Test(timeOut = 30000)
@@ -526,6 +628,7 @@ public class PulsarFunctionE2ETest {
         sinkConfig.setDeadLetterTopic(dlqTopic);
         sinkConfig.setInputSpecs(Collections.singletonMap(sourceTopic, ConsumerConfig.builder().receiverQueueSize(1000).build()));
         sinkConfig.setClassName(SinkForTest.class.getName());
+        @Cleanup
         LocalRunner localRunner = LocalRunner.builder()
                 .sinkConfig(sinkConfig)
                 .clientAuthPlugin(AuthenticationTls.class.getName())
@@ -553,16 +656,21 @@ public class PulsarFunctionE2ETest {
 
         // 3 send message
         int totalMsgs = 10;
+        Set<String> remainingMessagesToReceive = new HashSet<>();
         for (int i = 0; i < totalMsgs; i++) {
-            producer.newMessage().property(propertyKey, propertyValue).value("fail" + i).sendAsync();
+            String messageBody = "fail" + i;
+            producer.newMessage().property(propertyKey, propertyValue).value(messageBody).send();
+            remainingMessagesToReceive.add(messageBody);
         }
 
         //4 All messages should enter DLQ
         for (int i = 0; i < totalMsgs; i++) {
             Message<String> message = consumer.receive(10, TimeUnit.SECONDS);
             assertNotNull(message);
-            assertEquals(message.getValue(), "fail" + i);
+            remainingMessagesToReceive.remove(message.getValue());
         }
+
+        assertEquals(remainingMessagesToReceive, Collections.emptySet());
 
         //clean up
         producer.close();
@@ -588,11 +696,21 @@ public class PulsarFunctionE2ETest {
 
         sinkConfig.setInputSpecs(Collections.singletonMap(sourceTopic, ConsumerConfig.builder().receiverQueueSize(1000).build()));
 
-        admin.sink().createSinkWithUrl(sinkConfig, jarFilePathUrl);
+        if (jarFilePathUrl.startsWith(Utils.BUILTIN)) {
+            sinkConfig.setArchive(jarFilePathUrl);
+            admin.sinks().createSink(sinkConfig, null);
+        } else {
+            admin.sinks().createSinkWithUrl(sinkConfig, jarFilePathUrl);
+        }
 
         sinkConfig.setInputSpecs(Collections.singletonMap(sourceTopic, ConsumerConfig.builder().receiverQueueSize(523).build()));
 
-        admin.sink().updateSinkWithUrl(sinkConfig, jarFilePathUrl);
+        if (jarFilePathUrl.startsWith(Utils.BUILTIN)) {
+            sinkConfig.setArchive(jarFilePathUrl);
+            admin.sinks().updateSink(sinkConfig, null);
+        } else {
+            admin.sinks().updateSinkWithUrl(sinkConfig, jarFilePathUrl);
+        }
 
         retryStrategically((test) -> {
             try {
@@ -767,7 +885,7 @@ public class PulsarFunctionE2ETest {
 
 
         // delete functions
-        admin.sink().deleteSink(tenant, namespacePortion, sinkName);
+        admin.sinks().deleteSink(tenant, namespacePortion, sinkName);
 
         retryStrategically((test) -> {
             try {
@@ -787,17 +905,21 @@ public class PulsarFunctionE2ETest {
         Assert.assertEquals(foundFiles.length, 0, "Temporary files left over: " + Arrays.asList(foundFiles));
     }
 
+    @Test(timeOut = 20000, groups = "builtin")
+    public void testPulsarSinkStatsBuiltin() throws Exception {
+        String jarFilePathUrl = String.format("%s://data-generator", Utils.BUILTIN);
+        testPulsarSinkStats(jarFilePathUrl);
+    }
+
     @Test(timeOut = 20000)
     public void testPulsarSinkStatsWithFile() throws Exception {
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-io-data-generator.nar").getFile();
+        String jarFilePathUrl = getPulsarIODataGeneratorNar().toURI().toString();
         testPulsarSinkStats(jarFilePathUrl);
     }
 
     @Test(timeOut = 40000)
     public void testPulsarSinkStatsWithUrl() throws Exception {
-        String jarFilePathUrl = String.format("http://127.0.0.1:%d/pulsar-io-data-generator.nar",
-                fileServer.getAddress().getPort());
-        testPulsarSinkStats(jarFilePathUrl);
+        testPulsarSinkStats(fileServer.getUrl("/pulsar-io-data-generator.nar"));
     }
 
     private void testPulsarSourceStats(String jarFilePathUrl) throws Exception {
@@ -810,8 +932,12 @@ public class PulsarFunctionE2ETest {
         admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
 
         SourceConfig sourceConfig = createSourceConfig(tenant, namespacePortion, sourceName, sinkTopic);
-
-        admin.source().createSourceWithUrl(sourceConfig, jarFilePathUrl);
+        if (jarFilePathUrl.startsWith(Utils.BUILTIN)) {
+            sourceConfig.setArchive(jarFilePathUrl);
+            admin.sources().createSource(sourceConfig, null);
+        } else {
+            admin.sources().createSourceWithUrl(sourceConfig, jarFilePathUrl);
+        }
 
         retryStrategically((test) -> {
             try {
@@ -823,7 +949,12 @@ public class PulsarFunctionE2ETest {
 
         final String sinkTopic2 = "persistent://" + replNamespace + "/output2";
         sourceConfig.setTopicName(sinkTopic2);
-        admin.source().updateSourceWithUrl(sourceConfig, jarFilePathUrl);
+
+        if (jarFilePathUrl.startsWith(Utils.BUILTIN)) {
+            admin.sources().updateSource(sourceConfig, null);
+        } else {
+            admin.sources().updateSourceWithUrl(sourceConfig, jarFilePathUrl);
+        }
 
         retryStrategically((test) -> {
             try {
@@ -845,7 +976,7 @@ public class PulsarFunctionE2ETest {
 
         retryStrategically((test) -> {
             try {
-                return (admin.topics().getStats(sinkTopic2).publishers.size() == 1) && (admin.topics().getInternalStats(sinkTopic2).numberOfEntries > 4);
+                return (admin.topics().getStats(sinkTopic2).publishers.size() == 1) && (admin.topics().getInternalStats(sinkTopic2, false).numberOfEntries > 4);
             } catch (PulsarAdminException e) {
                 return false;
             }
@@ -925,19 +1056,174 @@ public class PulsarFunctionE2ETest {
         File[] foundFiles = dir.listFiles((dir1, name) -> name.startsWith("function"));
 
         Assert.assertEquals(foundFiles.length, 0, "Temporary files left over: " + Arrays.asList(foundFiles));
+        admin.sources().deleteSource(tenant, namespacePortion, sourceName);
+    }
+
+    @Test(timeOut = 20000, groups = "builtin")
+    public void testPulsarSourceStatsBuiltin() throws Exception {
+        String jarFilePathUrl = String.format("%s://data-generator", Utils.BUILTIN);
+        testPulsarSourceStats(jarFilePathUrl);
     }
 
     @Test(timeOut = 20000)
     public void testPulsarSourceStatsWithFile() throws Exception {
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-io-data-generator.nar").getFile();
+        String jarFilePathUrl = getPulsarIODataGeneratorNar().toURI().toString();
         testPulsarSourceStats(jarFilePathUrl);
     }
 
     @Test(timeOut = 40000)
     public void testPulsarSourceStatsWithUrl() throws Exception {
-        String jarFilePathUrl = String.format("http://127.0.0.1:%d/pulsar-io-data-generator.nar",
-                fileServer.getAddress().getPort());
-        testPulsarSourceStats(jarFilePathUrl);
+        testPulsarSourceStats(fileServer.getUrl("/pulsar-io-data-generator.nar"));
+    }
+
+    private void testPulsarBatchSourceStats(String jarFilePathUrl) throws Exception {
+    	final String namespacePortion = "io";
+        final String replNamespace = tenant + "/" + namespacePortion;
+        final String sinkTopic = "persistent://" + replNamespace + "/output";
+        final String sourceName = "PulsarBatchSource";
+        admin.namespaces().createNamespace(replNamespace);
+        Set<String> clusters = Sets.newHashSet(Lists.newArrayList("use"));
+        admin.namespaces().setNamespaceReplicationClusters(replNamespace, clusters);
+
+        SourceConfig sourceConfig = createSourceConfig(tenant, namespacePortion, sourceName, sinkTopic);
+        sourceConfig.setBatchSourceConfig(createBatchSourceConfig());
+
+        retryStrategically((test) -> {
+            try {
+                return (admin.topics().getStats(sinkTopic).publishers.size() == 1);
+            } catch (PulsarAdminException e) {
+                return false;
+            }
+        }, 10, 150);
+
+        final String sinkTopic2 = "persistent://" + replNamespace + "/output-" + sourceName;
+        sourceConfig.setTopicName(sinkTopic2);
+
+        if (jarFilePathUrl.startsWith(Utils.BUILTIN)) {
+          sourceConfig.setArchive(jarFilePathUrl);
+          admin.sources().createSource(sourceConfig, jarFilePathUrl);
+        } else {
+          admin.sources().createSourceWithUrl(sourceConfig, jarFilePathUrl);
+        }
+
+        retryStrategically((test) -> {
+            try {
+                TopicStats sourceStats = admin.topics().getStats(sinkTopic2);
+                return sourceStats.publishers.size() == 1
+                        && sourceStats.publishers.get(0).metadata != null
+                        && sourceStats.publishers.get(0).metadata.containsKey("id")
+                        && sourceStats.publishers.get(0).metadata.get("id").equals(String.format("%s/%s/%s", tenant, namespacePortion, sourceName));
+            } catch (PulsarAdminException e) {
+                return false;
+            }
+        }, 50, 150);
+
+        TopicStats sourceStats = admin.topics().getStats(sinkTopic2);
+        assertEquals(sourceStats.publishers.size(), 1);
+        assertNotNull(sourceStats.publishers.get(0).metadata);
+        assertTrue(sourceStats.publishers.get(0).metadata.containsKey("id"));
+        assertEquals(sourceStats.publishers.get(0).metadata.get("id"), String.format("%s/%s/%s", tenant, namespacePortion, sourceName));
+
+        retryStrategically((test) -> {
+            try {
+                return (admin.topics().getStats(sinkTopic2).publishers.size() == 1) && (admin.topics().getInternalStats(sinkTopic2, false).numberOfEntries > 4);
+            } catch (PulsarAdminException e) {
+                return false;
+            }
+        }, 50, 150);
+        assertEquals(admin.topics().getStats(sinkTopic2).publishers.size(), 1);
+
+        String prometheusMetrics = getPrometheusMetrics(pulsar.getListenPortHTTP().get());
+        log.info("prometheusMetrics: {}", prometheusMetrics);
+
+        Map<String, Metric> metrics = parseMetrics(prometheusMetrics);
+        Metric m = metrics.get("pulsar_source_received_total");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertTrue(m.value > 0.0);
+        m = metrics.get("pulsar_source_received_total_1min");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertTrue(m.value > 0.0);
+        m = metrics.get("pulsar_source_written_total");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertTrue(m.value > 0.0);
+        m = metrics.get("pulsar_source_written_total_1min");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertTrue(m.value > 0.0);
+        m = metrics.get("pulsar_source_source_exceptions_total");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertEquals(m.value, 0.0);
+        m = metrics.get("pulsar_source_source_exceptions_total_1min");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertEquals(m.value, 0.0);
+        m = metrics.get("pulsar_source_system_exceptions_total");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertEquals(m.value, 0.0);
+        m = metrics.get("pulsar_source_system_exceptions_total_1min");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertEquals(m.value, 0.0);
+        m = metrics.get("pulsar_source_last_invocation");
+        assertEquals(m.tags.get("cluster"), config.getClusterName());
+        assertEquals(m.tags.get("instance_id"), "0");
+        assertEquals(m.tags.get("name"), sourceName);
+        assertEquals(m.tags.get("namespace"), String.format("%s/%s", tenant, namespacePortion));
+        assertEquals(m.tags.get("fqfn"), FunctionCommon.getFullyQualifiedName(tenant, namespacePortion, sourceName));
+        assertTrue(m.value > 0.0);
+
+        // make sure all temp files are deleted
+        File dir = new File(System.getProperty("java.io.tmpdir"));
+        File[] foundFiles = dir.listFiles((dir1, name) -> name.startsWith("function"));
+
+        Assert.assertEquals(foundFiles.length, 0, "Temporary files left over: " + Arrays.asList(foundFiles));
+        admin.sources().deleteSource(tenant, namespacePortion, sourceName);
+    }
+
+    @Test(timeOut = 20000, groups = "builtin")
+    public void testPulsarBatchSourceStatsBuiltin() throws Exception {
+        String jarFilePathUrl = String.format("%s://batch-data-generator", Utils.BUILTIN);
+        testPulsarBatchSourceStats(jarFilePathUrl);
+    }
+
+    @Test(timeOut = 20000)
+    private void testPulsarBatchSourceStatsWithFile() throws Exception {
+    	String jarFilePathUrl = getPulsarIOBatchDataGeneratorNar().toURI().toString();
+    	testPulsarBatchSourceStats(jarFilePathUrl);
+    }
+
+    @Test(timeOut = 40000)
+    private void testPulsarBatchSourceStatsWithUrl() throws Exception {
+    	testPulsarBatchSourceStats(fileServer.getUrl("/pulsar-io-batch-data-generator.nar"));
     }
 
     @Test(timeOut = 20000)
@@ -958,7 +1244,7 @@ public class PulsarFunctionE2ETest {
         // create a producer that creates a topic at broker
         Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(sourceTopic).create();
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
         FunctionConfig functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
                 "my.*", sinkTopic, subscriptionName);
         admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
@@ -1294,7 +1580,7 @@ public class PulsarFunctionE2ETest {
         // create a producer that creates a topic at broker
         Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(sourceTopic).create();
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
         FunctionConfig functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
                 "my.*", sinkTopic, subscriptionName);
         admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
@@ -1359,7 +1645,6 @@ public class PulsarFunctionE2ETest {
 
     @Test(dataProvider = "validRoleName")
     public void testAuthorization(boolean validRoleName) throws Exception {
-
         final String namespacePortion = "io";
         final String replNamespace = tenant + "/" + namespacePortion;
         final String sinkTopic = "persistent://" + replNamespace + "/output";
@@ -1375,15 +1660,29 @@ public class PulsarFunctionE2ETest {
         propAdmin.setAllowedClusters(Sets.newHashSet(Lists.newArrayList("use")));
         admin.tenants().updateTenant(tenant, propAdmin);
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
         FunctionConfig functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
                 "my.*", sinkTopic, subscriptionName);
-        try {
-            admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
-            assertTrue(validRoleName);
-        } catch (org.apache.pulsar.client.admin.PulsarAdminException.NotAuthorizedException ne) {
-            assertFalse(validRoleName);
+        if (!validRoleName) {
+            // create a non-superuser admin to test the api
+            admin = spy(
+                PulsarAdmin.builder().serviceHttpUrl(pulsar.getWebServiceAddressTls())
+                    .tlsTrustCertsFilePath(TLS_TRUST_CERT_FILE_PATH)
+                    .allowTlsInsecureConnection(true).build());
+            try {
+                admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
+            } catch (org.apache.pulsar.client.admin.PulsarAdminException.NotAuthorizedException ne) {
+                assertFalse(validRoleName);
+            }
+        } else {
+            try {
+                admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
+                assertTrue(validRoleName);
+            } catch (org.apache.pulsar.client.admin.PulsarAdminException.NotAuthorizedException ne) {
+                fail();
+            }
         }
+
     }
 
     @Test(timeOut = 20000)
@@ -1403,7 +1702,7 @@ public class PulsarFunctionE2ETest {
         // create source topic
         Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(sourceTopic).create();
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
         FunctionConfig functionConfig = createFunctionConfig(tenant, namespacePortion, functionName,
                 sourceTopicName, sinkTopic, subscriptionName);
         admin.functions().createFunctionWithUrl(functionConfig, jarFilePathUrl);
@@ -1469,7 +1768,7 @@ public class PulsarFunctionE2ETest {
         // create a producer that creates a topic at broker
         Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(sourceTopic).create();
 
-        String jarFilePathUrl = Utils.FILE + ":" + getClass().getClassLoader().getResource("pulsar-functions-api-examples.jar").getFile();
+        String jarFilePathUrl = getPulsarApiExamplesJar().toURI().toString();
         FunctionConfig functionConfig = new FunctionConfig();
         functionConfig.setTenant(tenant);
         functionConfig.setNamespace(namespacePortion);
@@ -1614,7 +1913,6 @@ public class PulsarFunctionE2ETest {
         assertEquals(admin.topics().getStats(sourceTopic).subscriptions.size(), 1);
     }
 
-
     public static String getPrometheusMetrics(int metricsPort) throws IOException {
         StringBuilder result = new StringBuilder();
         URL url = new URL(String.format("http://%s:%s/metrics", "localhost", metricsPort));
@@ -1649,7 +1947,14 @@ public class PulsarFunctionE2ETest {
             checkArgument(matcher.matches());
             String name = matcher.group(1);
             Metric m = new Metric();
-            m.value = Double.valueOf(matcher.group(3));
+            String numericValue = matcher.group(3);
+            if (numericValue.equalsIgnoreCase("-Inf")) {
+                m.value = Double.NEGATIVE_INFINITY;
+            } else if (numericValue.equalsIgnoreCase("+Inf")) {
+                m.value = Double.POSITIVE_INFINITY;
+            } else {
+                m.value = Double.valueOf(numericValue);
+            }
             String tags = matcher.group(2);
             Matcher tagsMatcher = tagsPattern.matcher(tags);
             while (tagsMatcher.find()) {

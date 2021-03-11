@@ -20,7 +20,6 @@ package org.apache.pulsar.common.functions;
 
 import java.util.HashMap;
 import java.util.Map;
-
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -42,7 +41,10 @@ public class ConsumerConfig {
     private boolean isRegexPattern;
     @Builder.Default
     private Map<String, String> schemaProperties = new HashMap<>();
+    @Builder.Default
+    private Map<String, String> consumerProperties = new HashMap<>();
     private Integer receiverQueueSize;
+    private CryptoConfig cryptoConfig;
 
     public ConsumerConfig(String schemaType) {
         this.schemaType = schemaType;

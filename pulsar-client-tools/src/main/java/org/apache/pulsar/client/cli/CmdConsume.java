@@ -18,6 +18,8 @@
  */
 package org.apache.pulsar.client.cli;
 
+import static org.apache.commons.lang3.StringUtils.isNotBlank;
+
 import com.beust.jcommander.Parameter;
 import com.beust.jcommander.ParameterException;
 import com.beust.jcommander.Parameters;
@@ -51,6 +53,7 @@ import org.apache.pulsar.client.api.Message;
 import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.SubscriptionInitialPosition;
+import org.apache.pulsar.client.api.SubscriptionMode;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.util.collections.GrowableArrayBlockingQueue;
@@ -82,6 +85,9 @@ public class CmdConsume {
     @Parameter(names = { "-t", "--subscription-type" }, description = "Subscription type.")
     private SubscriptionType subscriptionType = SubscriptionType.Exclusive;
 
+    @Parameter(names = { "-m", "--subscription-mode" }, description = "Subscription mode.")
+    private SubscriptionMode subscriptionMode = SubscriptionMode.Durable;
+
     @Parameter(names = { "-p", "--subscription-position" }, description = "Subscription position.")
     private SubscriptionInitialPosition subscriptionInitialPosition = SubscriptionInitialPosition.Latest;
 
@@ -111,6 +117,11 @@ public class CmdConsume {
     @Parameter(names = { "-ac",
             "--auto_ack_chunk_q_full" }, description = "Auto ack for oldest message on queue is full")
     private boolean autoAckOldestChunkedMessageOnQueueFull = false;
+
+    @Parameter(names = { "-ekv",
+            "--encryption-key-value" }, description = "The URI of private key to decrypt payload, for example "
+                    + "file:///path/to/private.key or data:application/x-pem-file;base64,*****")
+    private String encKeyValue;
     
     private ClientBuilder clientBuilder;
     private Authentication authentication;
@@ -197,6 +208,7 @@ public class CmdConsume {
             ConsumerBuilder<byte[]> builder = client.newConsumer()
                     .subscriptionName(this.subscriptionName)
                     .subscriptionType(subscriptionType)
+                    .subscriptionMode(subscriptionMode)
                     .subscriptionInitialPosition(subscriptionInitialPosition);
 
             if (isRegex) {
@@ -205,16 +217,20 @@ public class CmdConsume {
                 builder.topic(topic);
             }
 
-            ConsumerBuilder<byte[]> consumerBuilder = client.newConsumer().topic(topic);
             if (this.maxPendingChuckedMessage > 0) {
-                consumerBuilder.maxPendingChuckedMessage(this.maxPendingChuckedMessage);
+                builder.maxPendingChuckedMessage(this.maxPendingChuckedMessage);
             }
             if (this.receiverQueueSize > 0) {
-                consumerBuilder.maxPendingChuckedMessage(this.receiverQueueSize);
+                builder.receiverQueueSize(this.receiverQueueSize);
             }
-            Consumer<byte[]> consumer = consumerBuilder.subscriptionName(this.subscriptionName)
-                    .autoAckOldestChunkedMessageOnQueueFull(this.autoAckOldestChunkedMessageOnQueueFull)
-                    .subscriptionType(subscriptionType).subscribe();
+
+            builder.autoAckOldestChunkedMessageOnQueueFull(this.autoAckOldestChunkedMessageOnQueueFull);
+
+            if (isNotBlank(this.encKeyValue)) {
+                builder.defaultCryptoKeyReader(this.encKeyValue);
+            }
+
+            Consumer<byte[]> consumer = builder.subscribe();
 
             RateLimiter limiter = (this.consumeRate > 0) ? RateLimiter.create(this.consumeRate) : null;
             while (this.numMessagesToConsume == 0 || numMessagesConsumed < this.numMessagesToConsume) {
@@ -255,9 +271,9 @@ public class CmdConsume {
 
         String wsTopic = String.format(
                 "%s/%s/" + (StringUtils.isEmpty(topicName.getCluster()) ? "" : topicName.getCluster() + "/")
-                        + "%s/%s/%s?subscriptionType=%s",
+                        + "%s/%s/%s?subscriptionType=%s&subscriptionMode=%s",
                 topicName.getDomain(), topicName.getTenant(), topicName.getNamespacePortion(), topicName.getLocalName(),
-                subscriptionName, subscriptionType.toString());
+                subscriptionName, subscriptionType.toString(), subscriptionMode.toString());
 
         String consumerBaseUri = serviceURL + (serviceURL.endsWith("/") ? "" : "/") + "ws/consumer/" + wsTopic;
         URI consumerUri = URI.create(consumerBaseUri);

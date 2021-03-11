@@ -84,10 +84,10 @@ public class ConsumerConfigurationData<T> implements Serializable, Cloneable {
     private long tickDurationMillis = 1000;
 
     private int priorityLevel = 0;
-    
+
     // max pending chunked message to avoid sitting incomplete message into the queue and memory
     private int maxPendingChuckedMessage = 10;
-    
+
     private boolean autoAckOldestChunkedMessageOnQueueFull = false;
 
     private long expireTimeOfIncompleteChunkedMessageMillis = 60 * 1000;
@@ -96,7 +96,7 @@ public class ConsumerConfigurationData<T> implements Serializable, Cloneable {
     private CryptoKeyReader cryptoKeyReader = null;
 
     @JsonIgnore
-    private MessageCrypto messageCrypto = null;
+    private transient MessageCrypto messageCrypto = null;
 
     private ConsumerCryptoFailureAction cryptoFailureAction = ConsumerCryptoFailureAction.FAIL;
 
@@ -110,7 +110,7 @@ public class ConsumerConfigurationData<T> implements Serializable, Cloneable {
 
     private RegexSubscriptionMode regexSubscriptionMode = RegexSubscriptionMode.PersistentOnly;
 
-    private DeadLetterPolicy deadLetterPolicy;
+    private transient DeadLetterPolicy deadLetterPolicy;
 
     private boolean retryEnable = false;
 
@@ -119,15 +119,26 @@ public class ConsumerConfigurationData<T> implements Serializable, Cloneable {
 
     private boolean autoUpdatePartitions = true;
 
+    private long autoUpdatePartitionsIntervalSeconds = 60;
+
     private boolean replicateSubscriptionState = false;
 
     private boolean resetIncludeHead = false;
 
-    private KeySharedPolicy keySharedPolicy;
+    private transient KeySharedPolicy keySharedPolicy;
+
+    private boolean batchIndexAckEnabled = false;
+
+    private boolean ackReceiptEnabled = false;
+
+    public void setAutoUpdatePartitionsIntervalSeconds(int interval, TimeUnit timeUnit) {
+        checkArgument(interval > 0, "interval needs to be > 0");
+        this.autoUpdatePartitionsIntervalSeconds = timeUnit.toSeconds(interval);
+    }
 
     @JsonIgnore
     public String getSingleTopic() {
-        checkArgument(topicNames.size() == 1);
+        checkArgument(topicNames.size() == 1, "topicNames needs to be = 1");
         return topicNames.iterator().next();
     }
 
